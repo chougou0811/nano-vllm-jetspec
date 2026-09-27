@@ -88,3 +88,41 @@ class LLMEngine:
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         return outputs
+
+    def generate_jetspec(
+        self,
+        prompt: str | list[int],
+        draft_model: str,
+        *,
+        max_tokens: int = 32,
+        tree_depth: int = 15,
+        tree_width: int = 7,
+        tree_budget: int = 63,
+        return_rounds: bool = True,
+    ) -> dict:
+        """Opt-in, single-request greedy JetSpec correctness runtime.
+
+        The normal scheduler/paged-attention ``generate`` path is unchanged.  Phase 1
+        intentionally rejects TP, CUDA graphs, batching and prefix-cache reuse.
+        """
+        if self.model_runner.world_size != 1:
+            raise ValueError("generate_jetspec Phase 1 requires tensor_parallel_size=1")
+        if not self.model_runner.enforce_eager:
+            raise ValueError("generate_jetspec Phase 1 requires enforce_eager=True")
+        from nanovllm.speculative.jetspec.runtime import JetSpecRuntime
+
+        cache_key = (draft_model, int(tree_depth), int(tree_width), int(tree_budget))
+        cached = getattr(self, "_jetspec_runtime", None)
+        if cached is None or cached[0] != cache_key:
+            runtime = JetSpecRuntime(
+                target=self.model_runner.model,
+                tokenizer=self.tokenizer,
+                draft_model=draft_model,
+                tree_depth=tree_depth,
+                tree_width=tree_width,
+                tree_budget=tree_budget,
+            )
+            self._jetspec_runtime = (cache_key, runtime)
+        else:
+            runtime = cached[1]
+        return runtime.generate(prompt, max_new_tokens=max_tokens, return_rounds=return_rounds)
