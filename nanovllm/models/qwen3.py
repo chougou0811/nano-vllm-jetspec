@@ -183,6 +183,84 @@ class Qwen3Attention(nn.Module):
         out = out.squeeze(0).transpose(0, 1).contiguous()
         return self.o_proj(out.flatten(1, -1)), new_key_value
 
+    def forward_paged_tree(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        k_pool: torch.Tensor,
+        v_pool: torch.Tensor,
+        node_slots: torch.Tensor,
+        logical_slots: torch.Tensor,
+        qq_bias: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        """Reference-numeric QKV plus JetSpec-style paged tree attention."""
+        weight = self.qkv_proj.weight
+        bias = self.qkv_proj.bias
+        q = F.linear(hidden_states, weight[:self.q_size], None if bias is None else bias[:self.q_size])
+        k = F.linear(
+            hidden_states,
+            weight[self.q_size:self.q_size + self.kv_size],
+            None if bias is None else bias[self.q_size:self.q_size + self.kv_size],
+        )
+        v = F.linear(
+            hidden_states,
+            weight[self.q_size + self.kv_size:],
+            None if bias is None else bias[self.q_size + self.kv_size:],
+        )
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        if not self.qkv_bias:
+            q = _reference_rms_norm(q, self.q_norm)
+            k = _reference_rms_norm(k, self.k_norm)
+        cos, sin = self.rotary_emb.cos_sin_cache[positions].chunk(2, dim=-1)
+        cos = cos.to(q.dtype)
+        sin = sin.to(q.dtype)
+
+        def apply_hf_rope(x):
+            x1, x2 = x.chunk(2, dim=-1)
+            return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+
+        q, k = apply_hf_rope(q), apply_hf_rope(k)
+        # The nano pool allocates 256-token blocks.  Present the same underlying
+        # storage as 16-token sub-pages to the official JetSpec kernel, matching
+        # its validated Qwen3 launch contract without copying any K/V bytes.
+        kernel_block_size = 16
+        k_pages = k_pool.view(-1, kernel_block_size, self.num_kv_heads, self.head_dim)
+        v_pages = v_pool.view(-1, kernel_block_size, self.num_kv_heads, self.head_dim)
+        blocks = torch.div(node_slots, kernel_block_size, rounding_mode="floor").long()
+        offsets = torch.remainder(node_slots, kernel_block_size).long()
+        k_pages[blocks, offsets] = k
+        v_pages[blocks, offsets] = v
+
+        from nanovllm.speculative.jetspec.paged_backend import paged_tree_attention
+
+        n = int(q.shape[0])
+        total = int(logical_slots.numel())
+        table_width = (total + kernel_block_size - 1) // kernel_block_size
+        block_table = torch.zeros((1, table_width), dtype=torch.int32, device=q.device)
+        cu = torch.tensor([0, n], dtype=torch.int32, device=q.device)
+        seq_lens = torch.tensor([total], dtype=torch.int32, device=q.device)
+        starts = torch.zeros((1,), dtype=torch.int32, device=q.device)
+        lens = torch.tensor([total], dtype=torch.int32, device=q.device)
+        out = paged_tree_attention(
+            q,
+            k_pages,
+            v_pages,
+            block_table,
+            cu,
+            seq_lens,
+            qq_bias,
+            self.scaling,
+            self.num_heads // self.num_kv_heads,
+            kernel_block_size,
+            logical_slots.view(1, -1),
+            starts,
+            lens,
+        )
+        return self.o_proj(out.flatten(1, -1))
+
 
 class Qwen3MLP(nn.Module):
 
@@ -286,6 +364,36 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = residual_stream + hidden_states
         return hidden_states, None, new_key_value, hidden_states
 
+    def forward_paged_tree(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        k_pool: torch.Tensor,
+        v_pool: torch.Tensor,
+        node_slots: torch.Tensor,
+        logical_slots: torch.Tensor,
+        qq_bias: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        normed = _reference_rms_norm(hidden_states, self.input_layernorm)
+        hidden_states = self.self_attn.forward_paged_tree(
+            positions,
+            normed,
+            k_pool,
+            v_pool,
+            node_slots,
+            logical_slots,
+            qq_bias,
+            block_size,
+        )
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.mlp.forward_dense(
+            _reference_rms_norm(hidden_states, self.post_attention_layernorm)
+        )
+        return residual + hidden_states
+
 
 class Qwen3Model(nn.Module):
 
@@ -334,6 +442,37 @@ class Qwen3Model(nn.Module):
         hidden_states = _reference_rms_norm(hidden_states, self.norm)
         target_hidden = torch.cat(tapped, dim=-1) if tapped else None
         return hidden_states, new_key_values, target_hidden
+
+    def forward_paged_tree(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_pool: torch.Tensor,
+        node_slots: torch.Tensor,
+        logical_slots: torch.Tensor,
+        qq_bias: torch.Tensor,
+        block_size: int,
+        target_layer_ids: list[int] | tuple[int, ...] = (),
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        hidden_states = self.embed_tokens(input_ids)
+        tapped = []
+        tap_set = set(int(i) for i in target_layer_ids)
+        for layer_id, layer in enumerate(self.layers):
+            hidden_states = layer.forward_paged_tree(
+                positions,
+                hidden_states,
+                kv_pool[0, layer_id],
+                kv_pool[1, layer_id],
+                node_slots,
+                logical_slots,
+                qq_bias,
+                block_size,
+            )
+            if layer_id in tap_set:
+                tapped.append(hidden_states)
+        hidden_states = _reference_rms_norm(hidden_states, self.norm)
+        target_hidden = torch.cat(tapped, dim=-1) if tapped else None
+        return hidden_states, target_hidden
 
 
 class Qwen3ForCausalLM(nn.Module):

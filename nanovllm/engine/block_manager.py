@@ -55,6 +55,23 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
+    def reserve_provisional(self, num_blocks: int) -> list[int]:
+        """Reserve unshared blocks for an opt-in speculative transaction."""
+        if num_blocks < 0 or len(self.free_block_ids) < num_blocks:
+            raise RuntimeError(
+                f"insufficient KV blocks: requested={num_blocks}, free={len(self.free_block_ids)}"
+            )
+        return [self._allocate_block() for _ in range(num_blocks)]
+
+    def release_provisional(self, block_ids: list[int]) -> None:
+        """Release blocks reserved by :meth:`reserve_provisional`."""
+        for block_id in block_ids:
+            block = self.blocks[int(block_id)]
+            if block.ref_count != 1 or int(block_id) not in self.used_block_ids:
+                raise RuntimeError(f"invalid provisional block ownership: {block_id}")
+            block.ref_count = 0
+            self._deallocate_block(int(block_id))
+
     def can_allocate(self, seq: Sequence) -> int:
         h = -1
         num_cached_blocks = 0

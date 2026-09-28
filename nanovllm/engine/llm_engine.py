@@ -98,6 +98,9 @@ class LLMEngine:
         tree_depth: int = 15,
         tree_width: int = 7,
         tree_budget: int = 63,
+        tree_backend: str = "dense",
+        qualification_rounds: tuple[int, ...] = (),
+        record_tree_layout: bool = False,
         return_rounds: bool = True,
     ) -> dict:
         """Opt-in, single-request greedy JetSpec correctness runtime.
@@ -109,6 +112,10 @@ class LLMEngine:
             raise ValueError("generate_jetspec Phase 1 requires tensor_parallel_size=1")
         if not self.model_runner.enforce_eager:
             raise ValueError("generate_jetspec Phase 1 requires enforce_eager=True")
+        if tree_backend not in ("dense", "paged"):
+            raise ValueError("tree_backend must be 'dense' or 'paged'")
+        if self.scheduler.waiting or self.scheduler.running:
+            raise RuntimeError("generate_jetspec requires an idle single-request scheduler")
         from nanovllm.speculative.jetspec.runtime import JetSpecRuntime
 
         cache_key = (draft_model, int(tree_depth), int(tree_width), int(tree_budget))
@@ -121,8 +128,18 @@ class LLMEngine:
                 tree_depth=tree_depth,
                 tree_width=tree_width,
                 tree_budget=tree_budget,
+                kv_pool=self.model_runner.kv_cache,
+                block_manager=self.scheduler.block_manager,
+                block_size=self.model_runner.block_size,
             )
             self._jetspec_runtime = (cache_key, runtime)
         else:
             runtime = cached[1]
-        return runtime.generate(prompt, max_new_tokens=max_tokens, return_rounds=return_rounds)
+        return runtime.generate(
+            prompt,
+            max_new_tokens=max_tokens,
+            tree_backend=tree_backend,
+            qualification_rounds=qualification_rounds,
+            record_tree_layout=record_tree_layout,
+            return_rounds=return_rounds,
+        )
