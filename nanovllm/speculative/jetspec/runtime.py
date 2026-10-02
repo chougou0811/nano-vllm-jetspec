@@ -11,12 +11,13 @@ from nanovllm.utils.context import reset_context
 
 
 class JetSpecRuntime:
-    """Single-request, greedy, eager JetSpec correctness MVP.
+    """Single-request, greedy, eager JetSpec execution.
 
     Tree construction and acceptance reuse engine-independent code from pinned
     JetSpec commit 2c7b3fa. Target execution uses nano-vLLM Qwen3 weights and an
-    opt-in dense SDPA tree mask. No Scheduler, prefix cache, CUDA graph or TP path
-    is involved.
+    dense SDPA or paged tree seam. The paged path commits accepted raw KV into
+    canonical request pages and retires reusable scratch. No Scheduler, prefix
+    cache, CUDA graph or TP path is involved.
     """
 
     def __init__(self, target, tokenizer, draft_model: str, *, tree_depth: int = 15,
@@ -85,6 +86,8 @@ class JetSpecRuntime:
         logical_slots: torch.Tensor,
         qq_bias: torch.Tensor,
     ):
+        if isinstance(self._active_state, PagedTargetState) and self._active_state.scratch_active:
+            self._active_state.scratch.check_stream()
         hidden, tapped = self.target.model.forward_paged_tree(
             input_ids,
             positions,
@@ -99,12 +102,27 @@ class JetSpecRuntime:
 
     @torch.inference_mode()
     def generate_target_paged(self, prompt: str | list[int], max_new_tokens: int = 32) -> dict:
+        if self._active_state is not None:
+            raise RuntimeError("JetSpecRuntime already has an active request")
+        try:
+            return self._generate_target_paged_request(prompt, max_new_tokens)
+        finally:
+            try:
+                if self._active_state is not None:
+                    self._active_state.clear()
+            finally:
+                self._active_state = None
+                reset_context()
+
+    def _generate_target_paged_request(self, prompt, max_new_tokens) -> dict:
         """Greedy comparator with the tree verify's fixed 63-row numerical shape.
 
         Row zero is the real next token; all other rows are isolated dummy nodes.
         This preserves QKV GEMM and attention reduction shapes of the tree backend.
         """
         reset_context()
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be positive")
         input_ids = self._prompt_ids(prompt)
         device = input_ids.device
         prompt_len = int(input_ids.shape[1])
@@ -117,6 +135,7 @@ class JetSpecRuntime:
             prompt_kv, prompt_hidden.unsqueeze(0), self.kv_pool,
             self.block_manager, self.block_size,
         )
+        self._active_state = state
         output = [int(first.item())]
         tree_nodes = self.tree_budget
         dummy = torch.zeros((tree_nodes - 1,), dtype=torch.long, device=device)
@@ -129,7 +148,7 @@ class JetSpecRuntime:
         try:
             while len(output) < max_new_tokens and output[-1] not in self.eos_token_ids:
                 state.assert_round_invariant()
-                node_slots, logical_slots = state.reserve_tree(tree_nodes)
+                node_slots, logical_slots = state.reserve_tree(tree_nodes, max_path_length=1)
                 positions = torch.cat((
                     torch.tensor([state.cache_len], device=device),
                     torch.full((tree_nodes - 1,), state.cache_len + 1, device=device),
@@ -142,13 +161,14 @@ class JetSpecRuntime:
                 state.commit_tree_path(
                     node_slots, node_hidden.unsqueeze(0),
                     torch.zeros((1,), dtype=torch.long, device=device),
+                    committed_tokens=torch.cat((state.committed, next_token.view(1, 1)), dim=1),
                 )
-                state.committed = torch.cat((state.committed, next_token.view(1, 1)), dim=1)
                 output.append(int(next_token.item()))
                 state.assert_round_invariant()
         finally:
             released = state.clear()
             state.clear()  # cleanup must be idempotent
+            self._active_state = None
         return {
             "token_ids": output,
             "numerical_path": "padded_single_path_63",
@@ -226,6 +246,7 @@ class JetSpecRuntime:
                 "logits_diff": tensor_diff(singleton_logits[0], paged_logits[0]),
             }
         finally:
+            torch.cuda.current_stream(slots.device).synchronize()
             self.block_manager.release_provisional(singleton_blocks)
 
         margin = None
@@ -313,6 +334,7 @@ class JetSpecRuntime:
                     "physical_slot": int(node_slots[node_id].item()),
                 })
             finally:
+                torch.cuda.current_stream(slots.device).synchronize()
                 self.block_manager.release_provisional(branch_blocks)
         branch_path, branch_accepted, branch_correction = gpu_tree_accept(
             tree.token_ids, branch_greedy, tree.parent_indices, tree.depth,
@@ -391,10 +413,33 @@ class JetSpecRuntime:
                  qualification_rounds: tuple[int, ...] = (),
                  record_tree_layout: bool = False,
                  return_rounds: bool = True) -> dict[str, Any]:
+        """Run a request with cleanup covering prefill, verify and commit failures."""
+        if self._active_state is not None:
+            raise RuntimeError("JetSpecRuntime already has an active request")
+        try:
+            return self._generate_request(
+                prompt, max_new_tokens=max_new_tokens, tree_backend=tree_backend,
+                qualification_rounds=qualification_rounds,
+                record_tree_layout=record_tree_layout, return_rounds=return_rounds,
+            )
+        finally:
+            try:
+                if self._active_state is not None:
+                    self._active_state.clear()
+            finally:
+                self._active_state = None
+                self.drafter.reset_cache()
+                reset_context()
+
+    def _generate_request(self, prompt: str | list[int], *, max_new_tokens: int,
+                          tree_backend: str, qualification_rounds: tuple[int, ...],
+                          record_tree_layout: bool, return_rounds: bool) -> dict[str, Any]:
         if tree_backend not in ("dense", "paged"):
             raise ValueError("tree_backend must be 'dense' or 'paged'")
         if tree_backend == "paged" and (self.kv_pool is None or self.block_manager is None):
             raise RuntimeError("paged tree backend requires nano-vLLM KV pool and BlockManager")
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be positive")
         reset_context()
         self.drafter.reset_cache()
         input_ids = self._prompt_ids(prompt)
@@ -437,6 +482,13 @@ class JetSpecRuntime:
         provisional_blocks_released_during_rounds = 0
         rejected_logical_slots = 0
         qualification_probes = []
+        round_count = 0
+        accept_lengths = []
+        tree_sizes = []
+        kv_copy_bytes = 0
+        admission_latency = 0.0
+        commit_host_latency = 0.0
+        peak_used_blocks = len(state.owned_blocks) if tree_backend == "paged" else 0
 
         from jetspec.tree import build_ancestor_matrix, gpu_tree_accept
 
@@ -459,12 +511,23 @@ class JetSpecRuntime:
             past_len = state.cache_len
             ancestor = build_ancestor_matrix(tree).bool()
             positions = past_len + tree.depth.long()
+            # Admission precedes verify: even the longest accepted path has a
+            # canonical destination, independently of the scratch reservation.
+            node_slots = None
+            if tree_backend == "paged":
+                admission_start = time.perf_counter()
+                node_slots, logical_slots = state.reserve_tree(
+                    n, max_path_length=min(n, self.tree_depth + 1)
+                )
+                admission_latency += time.perf_counter() - admission_start
+                peak_used_blocks = max(
+                    peak_used_blocks,
+                    len(self.block_manager.used_block_ids) - allocator_used_before,
+                )
             verify_start = torch.cuda.Event(enable_timing=True)
             verify_end = torch.cuda.Event(enable_timing=True)
             verify_start.record()
-            node_slots = None
             if tree_backend == "paged":
-                node_slots, logical_slots = state.reserve_tree(n)
                 qq_bias = torch.where(
                     ancestor,
                     torch.zeros((), dtype=torch.float32, device=device),
@@ -473,14 +536,6 @@ class JetSpecRuntime:
                 target_logits, node_hidden, final_hidden = self._target_forward_paged(
                     tree.token_ids, positions, node_slots, logical_slots, qq_bias
                 )
-                if len(rounds) in qualification_rounds:
-                    qualification_probes.append({
-                        "round_index": len(rounds),
-                        **self._qualification_probe(
-                            tree, state, ancestor, positions, node_slots,
-                            target_logits, node_hidden, final_hidden,
-                        ),
-                    })
                 provisional_kv = None
             else:
                 allowed = torch.zeros((n, past_len + n), dtype=torch.bool, device=device)
@@ -495,6 +550,14 @@ class JetSpecRuntime:
                 )
             verify_end.record()
             verify_events.append((verify_start, verify_end))
+            if tree_backend == "paged" and round_count in qualification_rounds:
+                qualification_probes.append({
+                    "round_index": round_count,
+                    **self._qualification_probe(
+                        tree, state, ancestor, positions, node_slots,
+                        target_logits, node_hidden, final_hidden,
+                    ),
+                })
             greedy = target_logits.argmax(dim=-1)
             path, accepted_len, correction = gpu_tree_accept(
                 tree.token_ids,
@@ -503,23 +566,33 @@ class JetSpecRuntime:
                 tree.depth,
                 max_depth=self.tree_depth,
             )
+            if tree_backend == "paged" and not torch.equal(
+                positions.index_select(0, path.long()),
+                torch.arange(past_len, past_len + path.numel(), device=device),
+            ):
+                raise RuntimeError("accepted RoPE positions do not match canonical destination")
             commit_start = torch.cuda.Event(enable_timing=True)
             commit_end = torch.cuda.Event(enable_timing=True)
             commit_start.record()
+            commit_host_start = time.perf_counter()
+            accepted = tree.token_ids.index_select(0, path[1:])
+            block = torch.cat((accepted, correction.view(1)))
+            new_committed = torch.cat((state.committed, block.view(1, -1)), dim=1)
             if tree_backend == "paged":
                 lifecycle = state.commit_tree_path(
-                    node_slots, node_hidden.unsqueeze(0), path
+                    node_slots, node_hidden.unsqueeze(0), path,
+                    committed_tokens=new_committed,
                 )
                 provisional_blocks_reserved += lifecycle["reserved_blocks"]
                 provisional_blocks_released_during_rounds += lifecycle["released_blocks"]
                 rejected_logical_slots += lifecycle["rejected_logical_slots"]
+                kv_copy_bytes += lifecycle["kv_copy_bytes"]
             else:
                 state.commit_tree_path(provisional_kv, node_hidden.unsqueeze(0), path)
-            accepted = tree.token_ids.index_select(0, path[1:])
-            block = torch.cat((accepted, correction.view(1)))
-            state.committed = torch.cat((state.committed, block.view(1, -1)), dim=1)
+                state.committed = new_committed
             state.assert_round_invariant()
             commit_end.record()
+            commit_host_latency += time.perf_counter() - commit_host_start
             commit_events.append((commit_start, commit_end))
 
             round_record = {
@@ -532,14 +605,20 @@ class JetSpecRuntime:
                 ],
                 "target_argmax_token_by_tree_node": [int(x) for x in greedy.tolist()],
                 "correction_token_id": int(correction.item()),
-                "kv_copy_or_gather": tree_backend == "dense",
+                "kv_copy_or_gather": True,
             }
+            if tree_backend == "paged":
+                round_record["kv_copy_bytes"] = lifecycle["kv_copy_bytes"]
+                round_record["capacity"] = state.capacity_snapshot()
             if record_tree_layout:
                 round_record["tree_token_ids"] = [int(x) for x in tree.token_ids.tolist()]
                 round_record["tree_parent_indices"] = [int(x) for x in tree.parent_indices.tolist()]
                 round_record["tree_depth"] = [int(x) for x in tree.depth.tolist()]
             if return_rounds:
                 rounds.append(round_record)
+            round_count += 1
+            accept_lengths.append(int(accepted_len) + 1)
+            tree_sizes.append(n)
             for value in block.tolist():
                 output_ids.append(int(value))
                 if int(value) in self.eos_token_ids:
@@ -550,6 +629,7 @@ class JetSpecRuntime:
         latency = time.perf_counter() - start
         verify_latency = sum(start.elapsed_time(end) for start, end in verify_events) / 1000.0
         commit_latency = sum(start.elapsed_time(end) for start, end in commit_events) / 1000.0
+        capacity_before_cleanup = state.capacity_snapshot() if tree_backend == "paged" else None
         final_invariant = {
             "committed_minus_one": int(state.committed.shape[1]) - 1,
             "target_kv_length": state.cache_len,
@@ -571,6 +651,8 @@ class JetSpecRuntime:
         # No generation state is reusable accidentally. A later call starts from empty
         # target state and reset Draft KV; rejected provisional tensors have no owner.
         blocks_released_cleanup = state.clear() if tree_backend == "paged" else 0
+        if tree_backend == "dense":
+            state.clear()
         self.drafter.reset_cache()
         self._active_state = None
         allocator_used_after = (
@@ -582,15 +664,25 @@ class JetSpecRuntime:
             "token_ids": output_ids,
             "text": self.tokenizer.decode(output_ids, skip_special_tokens=True),
             "rounds": rounds,
-            "target_verification_rounds": len(rounds),
-            "accept_lengths": [r["accepted_length_including_correction"] for r in rounds],
-            "tree_sizes": [r["tree_size"] for r in rounds],
+            "target_verification_rounds": round_count,
+            "accept_lengths": accept_lengths,
+            "tree_sizes": tree_sizes,
             "latency_s": latency,
             "tree_backend": tree_backend,
             "qualification_probes": qualification_probes,
             "target_verification_latency_s": verify_latency,
             "kv_commit_reclaim_latency_s": commit_latency,
-            "kv_copy_gather_rounds": len(rounds) if tree_backend == "dense" else 0,
+            "kv_copy_gather_rounds": round_count,
+            "lifecycle_design": "canonical_committed_reusable_scratch" if tree_backend == "paged" else "dense",
+            "kv_copy_bytes": kv_copy_bytes,
+            "kv_copy_read_write_bytes": 2 * kv_copy_bytes,
+            "capacity_before_cleanup": capacity_before_cleanup,
+            "peak_used_blocks": peak_used_blocks,
+            "peak_reserved_kv_slots": peak_used_blocks * self.block_size,
+            "admission_latency_s": admission_latency,
+            "commit_host_latency_s": commit_host_latency,
+            "verify_latency_by_round_s": [s.elapsed_time(e) / 1000.0 for s, e in verify_events],
+            "commit_latency_by_round_s": [s.elapsed_time(e) / 1000.0 for s, e in commit_events],
             "provisional_blocks_reserved": provisional_blocks_reserved,
             "provisional_blocks_released_during_rounds": provisional_blocks_released_during_rounds,
             "rejected_logical_slots": rejected_logical_slots,

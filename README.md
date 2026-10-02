@@ -60,6 +60,48 @@ See `bench.py` for benchmark.
 | vLLM           | 133,966     | 98.37    | 1361.84               |
 | Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
 
+## Experimental JetSpec integration
+
+`LLM.generate_jetspec(prompt, draft_model, tree_backend="paged")` is an opt-in
+greedy Qwen3 path. It currently requires one request, TP=1, eager execution,
+depth=15, width=7 and a 63-node tree. The ordinary scheduler and attention paths
+are unchanged; this is not yet Continuous Batching or prefix-cache integration.
+
+The Phase 3.0 paged lifetime contract is:
+
+```text
+reserve canonical tail + acquire reusable scratch
+  -> verify tree in scratch -> accept root-inclusive path
+  -> copy only accepted raw post-RoPE K/V to canonical tail
+  -> publish tokens/features/KV length -> retire scratch
+```
+
+Only canonical pages belong to a request's committed history. Scratch has its
+own lease, never enters prefix hashing, and is reused only after a CUDA event
+orders the previous verify/copy. Unused destination reservations are returned;
+finish, abort and exceptions fence GPU work before releasing pages. At each
+completed round, `KV length == feature length == committed tokens - 1`:
+the correction token remains an uncached anchor. Commit copies O(accepted path)
+KV, not the full history; tapped feature concatenation is still history-sized.
+
+Run the small-tensor tests without model weights:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The CPU suite replays 10/100/1000 rounds. Additional CUDA stream tests use small
+KV tensors and skip when CUDA is unavailable. Verify and commit must use the
+active lease's stream; between-round stream handoff waits on its readiness event.
+
+`benchmarks/jetspec_phase3.py --help` describes the matched baseline/new GPU
+comparison and separate oracle, raw-byte and poison/reuse checks. Report leased
+committed/scratch/destination slots separately from the globally preallocated
+GPU pool: lower lease amplification does not imply the entire pool shrinks.
+The current attention numerical path remains c1-only. Packed ragged kernels,
+scheduler admission, multi-request cancellation, prefix sharing, CUDA graphs
+and page-size comparisons require separate qualification.
+
 
 ## Star History
 

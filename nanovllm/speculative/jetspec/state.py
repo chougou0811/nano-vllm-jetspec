@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -51,9 +51,127 @@ class DenseTargetState:
         self.committed = torch.empty(0, dtype=torch.long)
 
 
+def _slots_for_blocks(
+    blocks: list[int], length: int, block_size: int, device: torch.device,
+    *, start: int = 0,
+) -> torch.Tensor:
+    """Canonical logical offsets mapped through a layer-shared block table."""
+    table = torch.tensor(blocks, dtype=torch.long, device=device)
+    positions = torch.arange(start, start + length, dtype=torch.long, device=device)
+    return table[positions // block_size] * block_size + positions % block_size
+
+
+def copy_accepted_kv(
+    kv_pool: torch.Tensor,
+    source_slots: torch.Tensor,
+    destination_slots: torch.Tensor,
+    block_size: int,
+) -> int:
+    """Copy only accepted raw, post-RoPE K/V, across both KV axes and all layers.
+
+    Advanced indexing materializes the selected payload before the scatter, so
+    this helper is overlap-safe as well. No prefix gather or RoPE recomputation
+    occurs. The returned byte count is payload size, not read + write traffic.
+    """
+    if source_slots.ndim != 1 or destination_slots.ndim != 1:
+        raise ValueError("KV copy requires one-dimensional slot maps")
+    if source_slots.numel() != destination_slots.numel():
+        raise ValueError("KV copy source and destination lengths differ")
+    src_blocks = torch.div(source_slots, block_size, rounding_mode="floor")
+    src_offsets = source_slots % block_size
+    dst_blocks = torch.div(destination_slots, block_size, rounding_mode="floor")
+    dst_offsets = destination_slots % block_size
+    accepted = kv_pool[:, :, src_blocks, src_offsets]
+    kv_pool[:, :, dst_blocks, dst_offsets] = accepted
+    return int(accepted.numel() * accepted.element_size())
+
+
+@dataclass
+class TreeScratchArena:
+    """Reusable, private workspace ownership, separate from committed requests.
+
+    Backing pages belong to the arena, never to a prefix cache or accepted path.
+    A future packed batch can partition these slots among its requests; c1 uses
+    one lease spanning its tree. Reuse waits on the retiring stream's event.
+    """
+
+    kv_pool: torch.Tensor
+    block_manager: object
+    block_size: int
+    blocks: list[int] = field(default_factory=list)
+    active: bool = False
+    _stream: object | None = field(default=None, repr=False)
+    _retired: object | None = field(default=None, repr=False)
+
+    @property
+    def capacity(self) -> int:
+        return len(self.blocks) * self.block_size
+
+    def wait_ready(self) -> None:
+        """Make retired writes visible to the current stream without host wait."""
+        if self.kv_pool.is_cuda and self._retired is not None:
+            torch.cuda.current_stream(self.kv_pool.device).wait_event(self._retired)
+
+    def acquire(self, n_nodes: int) -> torch.Tensor:
+        if self.active:
+            raise RuntimeError("tree scratch lease is already active")
+        if n_nodes <= 0 or n_nodes > self.capacity:
+            raise ValueError("tree does not fit admitted scratch capacity")
+        if self.kv_pool.is_cuda:
+            stream = torch.cuda.current_stream(self.kv_pool.device)
+            self.wait_ready()
+            self._stream = stream
+        slots = _slots_for_blocks(
+            self.blocks, n_nodes, self.block_size, self.kv_pool.device
+        )
+        self.active = True
+        return slots
+
+    def check_stream(self) -> None:
+        if self.kv_pool.is_cuda and self.active:
+            current = torch.cuda.current_stream(self.kv_pool.device)
+            if current != self._stream:
+                raise RuntimeError("verify and commit must use the scratch lease stream")
+
+    def retire(self) -> None:
+        if not self.active:
+            return
+        if self.kv_pool.is_cuda:
+            # Recording on the lease stream also covers verification exceptions.
+            event = torch.cuda.Event()
+            event.record(self._stream)
+            self._retired = event
+        self.active = False
+        self._stream = None
+
+    def synchronize(self) -> None:
+        if self.kv_pool.is_cuda:
+            if self.active:
+                self.retire()
+            if self._retired is not None:
+                self._retired.synchronize()
+
+    def clear(self) -> int:
+        self.retire()
+        self.synchronize()
+        released = len(self.blocks)
+        self.block_manager.release_provisional(self.blocks)
+        self.blocks = []
+        self._retired = None
+        return released
+
+
+@dataclass
+class _TreeRound:
+    node_slots: torch.Tensor
+    max_path_length: int
+    newly_reserved_blocks: int
+    destination_blocks: int
+
+
 @dataclass
 class PagedTargetState:
-    """Logical committed sequence backed by nano-vLLM's physical KV pool."""
+    """Canonical committed KV plus one bounded, reusable tree transaction arena."""
 
     committed: torch.Tensor
     target_hidden: torch.Tensor
@@ -63,6 +181,9 @@ class PagedTargetState:
     logical_slots: torch.Tensor
     owned_blocks: list[int]
     pending_blocks: list[int]
+    scratch: TreeScratchArena | None = None
+    _round: _TreeRound | None = field(default=None, repr=False)
+    _cleared: bool = field(default=False, repr=False)
 
     @classmethod
     def from_prefill(
@@ -74,75 +195,219 @@ class PagedTargetState:
         block_manager,
         block_size: int,
     ) -> "PagedTargetState":
+        if block_size <= 0 or kv_pool.ndim != 6 or kv_pool.shape[0] != 2:
+            raise ValueError("invalid KV pool geometry")
+        if kv_pool.shape[3] != block_size or block_manager.block_size != block_size:
+            raise ValueError("KV pool, allocator and state page geometries differ")
+        if len(prompt_key_values) != kv_pool.shape[1]:
+            raise ValueError("prefill KV layer count does not match the pool")
         cache_len = int(prompt_key_values[0][0].shape[0])
-        num_blocks = (cache_len + block_size - 1) // block_size
-        blocks = block_manager.reserve_provisional(num_blocks)
-        block_tensor = torch.tensor(blocks, dtype=torch.long, device=kv_pool.device)
-        positions = torch.arange(cache_len, dtype=torch.long, device=kv_pool.device)
-        slots = block_tensor[positions // block_size] * block_size + positions % block_size
-        physical_blocks = torch.div(slots, block_size, rounding_mode="floor").long()
-        offsets = torch.remainder(slots, block_size).long()
-        for layer_id, (keys, values) in enumerate(prompt_key_values):
-            kv_pool[0, layer_id, physical_blocks, offsets] = keys
-            kv_pool[1, layer_id, physical_blocks, offsets] = values
-        return cls(
-            committed=committed,
-            target_hidden=target_hidden,
-            kv_pool=kv_pool,
-            block_manager=block_manager,
-            block_size=int(block_size),
-            logical_slots=slots,
-            owned_blocks=blocks,
-            pending_blocks=[],
-        )
+        if committed.ndim != 2 or committed.shape[0] != 1:
+            raise ValueError("c1 committed tokens must have shape [1, tokens]")
+        if committed.shape[1] - 1 != cache_len or target_hidden.shape[1] != cache_len:
+            raise ValueError("prefill KV, feature and committed token lengths differ")
+        expected_shape = (cache_len, int(kv_pool.shape[4]), int(kv_pool.shape[5]))
+        for keys, values in prompt_key_values:
+            if tuple(keys.shape) != expected_shape or tuple(values.shape) != expected_shape:
+                raise ValueError("prefill KV shape does not match the pool")
+        blocks = block_manager.reserve_provisional((cache_len + block_size - 1) // block_size)
+        try:
+            slots = _slots_for_blocks(blocks, cache_len, block_size, kv_pool.device)
+            physical_blocks = torch.div(slots, block_size, rounding_mode="floor")
+            offsets = slots % block_size
+            for layer_id, (keys, values) in enumerate(prompt_key_values):
+                kv_pool[0, layer_id, physical_blocks, offsets] = keys
+                kv_pool[1, layer_id, physical_blocks, offsets] = values
+            scratch = TreeScratchArena(kv_pool, block_manager, int(block_size))
+            if kv_pool.is_cuda:
+                # The first round or clear may run on another stream. Retaining
+                # prefill's completion dependency protects its committed pages.
+                scratch._retired = torch.cuda.Event()
+                scratch._retired.record(torch.cuda.current_stream(kv_pool.device))
+            return cls(
+                committed=committed,
+                target_hidden=target_hidden,
+                kv_pool=kv_pool,
+                block_manager=block_manager,
+                block_size=int(block_size),
+                logical_slots=slots,
+                owned_blocks=blocks,
+                pending_blocks=[],
+                scratch=scratch,
+            )
+        except BaseException:
+            # Scatter may already have queued writes into pages being returned.
+            if kv_pool.is_cuda:
+                torch.cuda.current_stream(kv_pool.device).synchronize()
+            block_manager.release_provisional(blocks)
+            raise
 
     @property
     def cache_len(self) -> int:
         return int(self.logical_slots.numel())
 
-    def reserve_tree(self, n_nodes: int) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.pending_blocks:
-            raise RuntimeError("previous provisional tree allocation is still active")
-        num_blocks = (int(n_nodes) + self.block_size - 1) // self.block_size
-        self.pending_blocks = self.block_manager.reserve_provisional(num_blocks)
-        block_tensor = torch.tensor(
-            self.pending_blocks, dtype=torch.long, device=self.kv_pool.device
-        )
-        offsets = torch.arange(n_nodes, dtype=torch.long, device=self.kv_pool.device)
-        node_slots = (
-            block_tensor[offsets // self.block_size] * self.block_size
-            + offsets % self.block_size
-        )
-        return node_slots, torch.cat((self.logical_slots, node_slots))
+    @property
+    def scratch_blocks(self) -> list[int]:
+        return list(self.scratch.blocks) if self.scratch is not None else []
+
+    @property
+    def scratch_active(self) -> bool:
+        return self.scratch is not None and self.scratch.active
+
+    def capacity_snapshot(self) -> dict[str, int | float]:
+        scratch_count = len(self.scratch_blocks)
+        total = len(self.owned_blocks) + len(self.pending_blocks) + scratch_count
+        reserved_slots = total * self.block_size
+        live = self.cache_len
+        return {
+            "committed_blocks": len(self.owned_blocks),
+            "scratch_blocks": scratch_count,
+            "pending_destination_blocks": len(self.pending_blocks),
+            "reserved_destination_blocks": len(self.pending_blocks),
+            "used_blocks": len(self.block_manager.used_block_ids),
+            "reserved_slots": reserved_slots,
+            "reserved_kv_slots": reserved_slots,
+            "live_slots": live,
+            "live_kv_slots": live,
+            "amplification": reserved_slots / live if live else 0.0,
+        }
+
+    def reserve_tree(
+        self, n_nodes: int, max_path_length: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Atomically admit both worst-case destination growth and scratch.
+
+        The runtime supplies depth + 1 (root-inclusive). The default is the
+        conservative bound n_nodes, useful for generic allocator replays.
+        """
+        if self._cleared:
+            raise RuntimeError("cannot reserve a tree for a cleared request")
+        if self._round is not None or self.pending_blocks or self.scratch_active:
+            raise RuntimeError("previous provisional tree transaction is still active")
+        n_nodes = int(n_nodes)
+        max_path_length = n_nodes if max_path_length is None else int(max_path_length)
+        if n_nodes <= 0 or not 1 <= max_path_length <= n_nodes:
+            raise ValueError("invalid tree size or maximum accepted path length")
+        if self.scratch is None:
+            self.scratch = TreeScratchArena(self.kv_pool, self.block_manager, self.block_size)
+        required_destination = (self.cache_len + max_path_length + self.block_size - 1) // self.block_size
+        destination_count = required_destination - len(self.owned_blocks)
+        scratch_count = (n_nodes + self.block_size - 1) // self.block_size
+        scratch_growth = max(0, scratch_count - len(self.scratch.blocks))
+        # One allocator call means neither lease can be admitted without the other.
+        new_blocks = self.block_manager.reserve_provisional(destination_count + scratch_growth)
+        old_scratch_count = len(self.scratch.blocks)
+        try:
+            destination = new_blocks[:destination_count]
+            self.scratch.blocks.extend(new_blocks[destination_count:])
+            node_slots = self.scratch.acquire(n_nodes)
+            logical = torch.cat((self.logical_slots, node_slots))
+            self.pending_blocks = destination
+            self._round = _TreeRound(
+                node_slots, max_path_length, len(new_blocks), destination_count,
+            )
+            return node_slots, logical
+        except BaseException:
+            self.scratch.retire()
+            self.scratch.synchronize()
+            self.scratch.blocks = self.scratch.blocks[:old_scratch_count]
+            self.block_manager.release_provisional(new_blocks)
+            self.pending_blocks = []
+            self._round = None
+            raise
 
     def commit_tree_path(
         self,
         node_slots: torch.Tensor,
         node_hidden: torch.Tensor,
         accepted_path: torch.Tensor,
-    ) -> dict[str, int]:
-        if not self.pending_blocks:
-            raise RuntimeError("no provisional tree allocation to commit")
-        selected = accepted_path.long()
-        accepted_slots = node_slots.index_select(0, selected)
-        self.logical_slots = torch.cat((self.logical_slots, accepted_slots))
-        self.target_hidden = torch.cat(
-            (self.target_hidden, node_hidden.index_select(1, selected)), dim=1
+        *,
+        committed_tokens: torch.Tensor | None = None,
+    ) -> dict[str, int | float]:
+        """Copy accepted-only KV to the canonical tail, then publish metadata.
+
+        If preparation or copy raises, committed metadata remains unchanged.
+        abort_tree()/clear() fence queued writes and reclaim the reservation.
+        committed_tokens is the complete new history including correction;
+        correction has no destination slot. Omitting it preserves the old API,
+        whose caller must publish tokens before asserting the round invariant.
+        """
+        transaction = self._round
+        if transaction is None or self.scratch is None or not self.scratch.active:
+            raise RuntimeError("no provisional tree transaction to commit")
+        self.scratch.check_stream()
+        if node_slots.shape != transaction.node_slots.shape or not torch.equal(node_slots, transaction.node_slots):
+            raise ValueError("node slots do not belong to the active tree transaction")
+        if accepted_path.ndim != 1:
+            raise ValueError("accepted path must be one-dimensional")
+        selected = accepted_path.to(device=node_slots.device, dtype=torch.long)
+        path = selected.tolist()
+        if not path or path[0] != 0 or len(set(path)) != len(path):
+            raise ValueError("accepted path must be root-inclusive and contain unique nodes")
+        if min(path) < 0 or max(path) >= node_slots.numel():
+            raise ValueError("accepted path contains an out-of-range tree node")
+        if len(path) > transaction.max_path_length:
+            raise ValueError("accepted path exceeds admitted destination capacity")
+        if node_hidden.ndim != 3 or node_hidden.shape[0] != 1 or node_hidden.shape[1] != node_slots.numel():
+            raise ValueError("tree features do not match the active tree")
+        next_length = self.cache_len + len(path)
+        if committed_tokens is not None:
+            if committed_tokens.ndim != 2 or tuple(committed_tokens.shape) != (1, next_length + 1):
+                raise ValueError("published tokens must include exactly one uncached correction")
+        combined_blocks = self.owned_blocks + self.pending_blocks
+        source = node_slots.index_select(0, selected)
+        destination = _slots_for_blocks(
+            combined_blocks, len(path), self.block_size, self.kv_pool.device,
+            start=self.cache_len,
         )
-        # A nano block contains 256 slots while this tree has at most 63 nodes.
-        # Root is always committed, so accepted and rejected nodes share a live
-        # physical block. Drop rejected logical ownership now and retain the block
-        # lease until request cleanup; token-granular free would corrupt accepted KV.
-        reserved = len(self.pending_blocks)
-        self.owned_blocks.extend(self.pending_blocks)
+        next_slots = torch.cat((self.logical_slots, destination))
+        next_hidden = torch.cat((self.target_hidden, node_hidden.index_select(1, selected)), dim=1)
+        needed_blocks = (next_length + self.block_size - 1) // self.block_size
+        used_destination = needed_blocks - len(self.owned_blocks)
+        retained = self.pending_blocks[:used_destination]
+        unused = self.pending_blocks[used_destination:]
+        next_owned_blocks = self.owned_blocks + retained
+        copy_bytes = copy_accepted_kv(self.kv_pool, source, destination, self.block_size)
+        # No unused destination has been written. All potentially live writes are
+        # covered by the retiring event before scratch can be acquired again.
+        self.scratch.retire()
+        self.block_manager.release_provisional(unused)
+        self.owned_blocks = next_owned_blocks
         self.pending_blocks = []
+        self.logical_slots = next_slots
+        self.target_hidden = next_hidden
+        if committed_tokens is not None:
+            self.committed = committed_tokens
+        self._round = None
         return {
-            "reserved_blocks": reserved,
-            "released_blocks": 0,
-            "rejected_logical_slots": int(node_slots.numel() - accepted_slots.numel()),
+            **self.capacity_snapshot(),
+            "reserved_blocks": transaction.newly_reserved_blocks,
+            "released_blocks": len(unused),
+            "reserved_destination_blocks": transaction.destination_blocks,
+            "rejected_logical_slots": int(node_slots.numel() - len(path)),
+            "accepted_kv_slots": len(path),
+            "kv_copy_bytes": copy_bytes,
         }
 
+    def abort_tree(self) -> int:
+        """Discard the round without publishing any committed metadata."""
+        if self._round is None:
+            return 0
+        if self.scratch is not None:
+            self.scratch.retire()
+            # A failed copy may have written pending destination pages. They must
+            # not reenter the global allocator until those writes are complete.
+            if self.pending_blocks:
+                self.scratch.synchronize()
+        released = len(self.pending_blocks)
+        self.block_manager.release_provisional(self.pending_blocks)
+        self.pending_blocks = []
+        self._round = None
+        return released
+
     def assert_round_invariant(self) -> None:
+        if self.scratch is not None:
+            self.scratch.wait_ready()
         expected = int(self.committed.shape[1]) - 1
         if self.cache_len != expected or int(self.target_hidden.shape[1]) != expected:
             raise RuntimeError(
@@ -150,21 +415,40 @@ class PagedTargetState:
                 f"committed-1={expected}, logical_slots={self.cache_len}, "
                 f"target_hidden={self.target_hidden.shape[1]}"
             )
-        if self.pending_blocks:
-            raise RuntimeError("provisional blocks survived a completed round")
-        for block_id in self.owned_blocks:
+        if self._round is not None or self.pending_blocks or self.scratch_active:
+            raise RuntimeError("provisional tree transaction survived a completed round")
+        expected_blocks = (self.cache_len + self.block_size - 1) // self.block_size
+        if len(self.owned_blocks) != expected_blocks:
+            raise RuntimeError("committed pages are not tightly allocated")
+        canonical = _slots_for_blocks(
+            self.owned_blocks, self.cache_len, self.block_size, self.kv_pool.device,
+        )
+        if not torch.equal(canonical, self.logical_slots):
+            raise RuntimeError("committed slot map is not canonical")
+        all_blocks = self.owned_blocks + self.scratch_blocks
+        if len(set(all_blocks)) != len(all_blocks):
+            raise RuntimeError("committed and tree scratch block ownership overlaps")
+        for block_id in all_blocks:
             block = self.block_manager.blocks[block_id]
             if block.ref_count != 1 or block_id not in self.block_manager.used_block_ids:
                 raise RuntimeError(f"lost paged KV ownership for block {block_id}")
+            if block.hash != -1 or block.token_ids:
+                raise RuntimeError(f"private JetSpec page entered the prefix cache: {block_id}")
 
     def clear(self) -> int:
-        blocks = self.pending_blocks + self.owned_blocks
-        if blocks:
-            self.block_manager.release_provisional(blocks)
-        released = len(blocks)
+        if self._cleared:
+            return 0
+        aborted_released = self.abort_tree()
+        # This also fences prefill-only requests, which have not retired scratch.
+        if self.kv_pool.is_cuda:
+            torch.cuda.current_stream(self.kv_pool.device).synchronize()
+        scratch_released = self.scratch.clear() if self.scratch is not None else 0
+        released = len(self.owned_blocks) + scratch_released + aborted_released
+        self.block_manager.release_provisional(self.owned_blocks)
         self.pending_blocks = []
         self.owned_blocks = []
         self.logical_slots = torch.empty(0, dtype=torch.long, device=self.kv_pool.device)
         self.target_hidden = torch.empty(0, device=self.kv_pool.device)
         self.committed = torch.empty(0, dtype=torch.long, device=self.kv_pool.device)
+        self._cleared = True
         return released

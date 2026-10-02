@@ -61,16 +61,32 @@ class BlockManager:
             raise RuntimeError(
                 f"insufficient KV blocks: requested={num_blocks}, free={len(self.free_block_ids)}"
             )
-        return [self._allocate_block() for _ in range(num_blocks)]
+        allocated = []
+        try:
+            for _ in range(num_blocks):
+                allocated.append(self._allocate_block())
+        except BaseException:
+            # Keep a multi-page admission atomic even if allocation is interrupted.
+            self.release_provisional(allocated)
+            raise
+        return allocated
 
     def release_provisional(self, block_ids: list[int]) -> None:
         """Release blocks reserved by :meth:`reserve_provisional`."""
-        for block_id in block_ids:
-            block = self.blocks[int(block_id)]
-            if block.ref_count != 1 or int(block_id) not in self.used_block_ids:
+        normalized = [int(block_id) for block_id in block_ids]
+        if len(set(normalized)) != len(normalized):
+            raise RuntimeError("duplicate provisional block release")
+        # Validate the complete release before mutating any ownership.
+        for block_id in normalized:
+            if block_id < 0 or block_id >= len(self.blocks):
                 raise RuntimeError(f"invalid provisional block ownership: {block_id}")
+            block = self.blocks[block_id]
+            if block.ref_count != 1 or block_id not in self.used_block_ids:
+                raise RuntimeError(f"invalid provisional block ownership: {block_id}")
+        for block_id in normalized:
+            block = self.blocks[block_id]
             block.ref_count = 0
-            self._deallocate_block(int(block_id))
+            self._deallocate_block(block_id)
 
     def can_allocate(self, seq: Sequence) -> int:
         h = -1
