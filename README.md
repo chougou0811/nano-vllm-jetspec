@@ -166,8 +166,9 @@ divergences include BF16 near ties even with the same total Q; tree versus
 chain reduction grouping and changing request-removal/GEMM shapes are not
 bitwise-equivalent references. The harness reports exact-match failures and
 first-divergence margins explicitly. These tests do not establish strict
-AR-token equivalence for all serving schedules. Do not advertise this path as
-fully lossless multi-request decoding until that gate is resolved.
+AR-token equivalence for all serving schedules. The identical-state diagnostic
+below qualifies the six failures as numerical drift, not a semantic/addressing
+fix. Strict cross-layout lossless decoding remains an unsupported guarantee.
 
 [Recorded qualification](benchmarks/phase31_qualification.json) contains source
 fingerprints, first-divergence evidence, timing distributions and raw-artifact
@@ -184,6 +185,89 @@ Request-local state, packed metadata, shared scratch and step-boundary
 admission are foundations for Continuous Batching. Scheduler integration,
 batched/chunked prefill and Draft, backpressure/preemption, prefix sharing,
 asynchronous serving, TP and CUDA graphs remain separate work.
+
+### Phase 3.1 numerical qualification
+
+The follow-up [numerical qualification](benchmarks/phase31_numerical_qualification.json)
+supplements, rather than rewrites, the original 14/20 strict-match result.
+Production arithmetic, precision flags and serving code are unchanged.
+
+```bash
+PYTHONFAULTHANDLER=1 python benchmarks/jetspec_phase31_numerics.py \
+  --original /root/autodl-tmp/benchmarks/jetspec-phase31/final-stable.json \
+  --output /tmp/jetspec-phase31-numerics.json
+```
+
+The diagnostic snapshots actual canonical KV before commit, restores it
+byte-for-byte, and teacher-forces the same ancestor tokens through serial
+root-AR forwards. Instrumentation observes the actual 36-layer Target:
+input hidden, normalization, split Q/K/V, RoPE, attention, o_proj, residuals,
+MLP, final hidden and lm_head. Restored packed logits must reproduce the
+original logits exactly. This avoids comparing two already-drifted caches
+and mistaking their downstream differences for a new correctness bug.
+
+Zero-based first materialized BF16 differences, starting from identical KV:
+
+| Case / prompt | Disputed output index | First BF16 stage | Tree node |
+| --- | ---: | --- | ---: |
+| c2 equal / natural language | 14 | layer 1 attention output | 4 |
+| c2 equal / math | 27 | layer 2 attention output | 8 |
+| c3 ragged 63/31/47 / math | 27 | layer 13 attention output | 8 |
+| c4 equal / natural language | 14 | layer 2 attention output | 4 |
+| c4 ragged / math | 27 | layer 2 attention output | 8 |
+| c4 ragged / long continuation | 26 | layer 14 attention output | 2 |
+
+Each first BF16 difference affects only 1–2 of 4096 elements. Identical Q
+and chronological visible K/V are checked explicitly. An independent CPU
+FP64 oracle reconstructs visibility from parent links, not the production
+mask. The actual TILE=64 Triton kernel is replayed with FP32 output, both
+with sparse tree-key positions and compact chronological keys; rounding must
+reproduce the actual packed and serial BF16 outputs respectively. This
+separates pre-round reduction drift from its later BF16 manifestation.
+All six first FP32 differences are at layer 0 attention, at the same listed
+nodes (max-absolute delta 1.49e-8–5.96e-8). These round-0 origins predict
+output indices 2/3, before the disputed outputs in the table. All 36 layers
+of earlier accepted nodes remain FP32-equal. Across 364 sparse/compact
+operator controls, the worst FP64-oracle error is 1.21e-5 absolute and
+8.32e-7 relative RMS, below the predeclared bounds.
+
+At the disputed outputs, five traces first differ in attention over already
+numerically different historical KV. Long continuation additionally has
+identical layer-0 projection input but Q=126 versus Q=204; vanilla `F.linear`
+reproduces both Q outputs without any JetSpec attention or slot addressing.
+Sharing the packed round-start KV removes all six disputed argmax flips.
+Full token prefixes/positions, independent ancestry, fixed-layout layerwise
+request/branch perturbations and raw commit checks pass. Near-tie margins
+explain the flips only alongside these operator controls; the inequality
+`margin <= 2 * ||logits_a - logits_b||_infinity` is not itself a correctness
+proof.
+
+Phase 3.1 is frozen under this bounded, finite-input numerical contract:
+
+- Semantic gates remain exact: request-local prefix/ancestry/depth/RoPE,
+  slot ownership, accepted-only byte-exact commit, immutable history,
+  transaction recovery and scratch retirement/reuse.
+- On the same hardware, software versions and precision flags, repeated
+  identical-state executions with the same shape/layout, and
+  finite other-request/off-branch perturbations at fixed layout, must retain
+  bitwise-identical selected results. Arbitrary NaN/Inf activations in valid
+  masked nodes are not covered (`0 * NaN` is not zero).
+- Pre-BF16 FP32 attention is compared with independent FP64 visible-key
+  attention: scaled max-absolute error and relative RMS must both be <=1e-4.
+  BF16 quantization is reported separately, not used to loosen this bound.
+  The isolated BF16 Q GEMM uses a separate predeclared scaled/RMS envelope
+  of 2^-7; this is an empirical qualification envelope, not a universal
+  dot-product error theorem or a per-element one-ULP guarantee.
+- Different GEMM shapes or tree/chain key layouts are numerically qualified,
+  not required to have bitwise-identical logits or complete greedy token
+  sequences. The strict 14/20 result remains visible; exact cross-schedule
+  AR tokens and arbitrary sampling-distribution equivalence are not claimed.
+
+An exit-139 retry with the original harness completed with exit 0; the six
+token mismatches were reproduced, but the native crash was not. It remains
+an unlocalized known anomaly. These findings unblock subsequent scheduler
+work under the stated contract; no Continuous Batching functionality is
+implemented in this numerical qualification.
 
 
 ## Star History

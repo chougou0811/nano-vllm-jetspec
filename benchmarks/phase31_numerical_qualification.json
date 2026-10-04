@@ -1,0 +1,638 @@
+{
+  "schema_version": 1,
+  "phase": "3.1 numerical follow-up",
+  "status": "QUALIFIED for finite-input semantic and numerical contract; strict cross-layout AR token identity remains NOT QUALIFIED",
+  "production_base_revision": "3f8c4b27ab4e15396750810dc32e21b40016e7c9",
+  "production_changes_required": false,
+  "continuous_batching_implemented": false,
+  "freeze_decision": "Phase 3.1 may freeze under the explicit contract below; subsequent scheduler work may begin without promising strict cross-layout losslessness",
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "torch": "2.8.0+cu128",
+    "cuda": "12.8",
+    "bf16_reduced_precision_reduction": true,
+    "tf32_matmul": false,
+    "target": "/root/autodl-tmp/models/modelscope-Qwen3-8B",
+    "draft": "/root/autodl-tmp/models/jetspec-qwen3-8b-020a198caefde24a2891ad827cba7fb977ccdc36",
+    "tensor_parallel_size": 1,
+    "enforce_eager": true,
+    "dtype": "bfloat16",
+    "max_new_tokens": 32
+  },
+  "source_provenance": {
+    "production_source_sha256": "e12154b39c3806d29b576bd30c396ce90d4b8b21613516a456880084cfdead0c",
+    "production_file_sha256": {
+      "nanovllm/speculative/jetspec/batch_runtime.py": "f42f1815647462ed0fd5daba61f949ab595dffb27db2527efc852ecb8bf40f3d",
+      "nanovllm/speculative/jetspec/packed_metadata.py": "382582236a9f32037139c324d9d29f803a32239ebf26466f8c4d84b9dd599f11",
+      "nanovllm/speculative/jetspec/paged_backend.py": "fe62c92aaa5137f4c14cc3c73d07e3af20931dc53545481c78fda01f47262ab8",
+      "nanovllm/speculative/jetspec/state.py": "4e2801d792774d5d2ab6e128f98f3338349b53cd0abc81f317b170753405717e",
+      "nanovllm/models/qwen3.py": "0c0ae9af25cefb1463743f833b6eec4f19a11dda7be26cafb635e69352a86559",
+      "nanovllm/engine/llm_engine.py": "3aceacff214e2996f290d8b09b2f638d87d522eab498b326d7f5b9c186db736c",
+      "nanovllm/engine/block_manager.py": "5eb312b0f7a44f18abf5b367a56d12d4720236f8ccef75d34509bafa63a91754"
+    },
+    "diagnostic_file_sha256": {
+      "jetspec_phase31_numerics.py": "2c2fa199068ac9ac5d3623a46a058c5bde5c1252f87c1138bba9ef5393a26b91",
+      "jetspec_layer_trace.py": "8386cbf150907d0f303b26201acee3c1a8cf1b51b02a812f837202bd31b8939b",
+      "jetspec_numeric_oracles.py": "62d5c4356f1bfa893e5caa96364e07a89f17bce0ee7da741c35170ff0e1dd8f4"
+    },
+    "production_and_diagnostics_unchanged_during_run": true,
+    "preserved_uncommitted_legacy_runtime_git_blob": "32cab56bbeee4981ef346f446b7e2aedc0f8e106",
+    "legacy_runtime_not_called_by_phase31": true,
+    "official_jetspec_revision": "2c7b3fae75690dfe9a188a37d7fdfd43ee0e032f",
+    "official_vllm_jetspec_revision": "f90d5ca17a2c05f436a80ee2e0984cc7a22e1a16"
+  },
+  "baseline_retained": {
+    "qualification": "benchmarks/phase31_qualification.json",
+    "strict_packed_root_ar_requests_checked": 20,
+    "strict_packed_root_ar_exact_requests": 14,
+    "strict_packed_root_ar_all_exact": false,
+    "c1_oracle_exact": "5/5",
+    "frozen_request_branch_isolation_checks": 302,
+    "all_layer_raw_copy_checks": 99,
+    "history_and_rejected_checks": 179,
+    "performance_and_capacity_changed": false
+  },
+  "method": [
+    "snapshot all-layer canonical KV before commit and restore its bytes exactly",
+    "reproduce original closed-loop common token prefix, disputed semantic tokens/positions and logits",
+    "trace actual input hidden, norm, QKV, RoPE, attention, o_proj, MLP, final hidden and lm_head",
+    "teacher-force identical ancestor tokens from identical round-start KV through actual serial root-AR forwards",
+    "search accepted nodes chronologically at/before the disputed prediction, then stages in execution order",
+    "inspect all 36 layers at earlier BF16-equal nodes with FP32-output replay before attributing the first FP32 origin",
+    "reconstruct visible keys independently from parent links, compare actual sparse/compact Triton FP32 output to CPU FP64 attention",
+    "require sparse/compact FP32 outputs rounded to BF16 to reproduce actual packed/serial results",
+    "finite other-request and off-branch perturbations preserve fixed layout and selected results at every traced stage",
+    "replay long-continuation split Q projection in vanilla F.linear with identical selected input and actual Q=126/204 matrices"
+  ],
+  "gates": {
+    "six_original_mismatches_reproduced": true,
+    "all_independent_visibility_depth_checks_passed": true,
+    "all_fixed_layout_layerwise_isolation_passed": true,
+    "all_attention_pre_round_oracle_bounds_passed": true,
+    "allocator_clean_after_close": true,
+    "production_source_unchanged": true,
+    "diagnostic_source_unchanged": true,
+    "all_pre_round_layer_oracle_bounds_passed": true,
+    "all_actual_serial_roundtrips_exact": true,
+    "all_packed_roundtrips_exact": true,
+    "attention_operator_controls_checked": 364,
+    "same_round_start_kv_removes_all_six_disputed_argmax_flips": true
+  },
+  "operator_oracle_summary": {
+    "controls_checked": 364,
+    "fp32_attention_scaled_max_abs_bound": 0.0001,
+    "fp32_attention_relative_rms_bound": 0.0001,
+    "worst_max_abs_error": 0.000012025281506566898,
+    "worst_relative_rms_error": 8.310525486743288e-7,
+    "scope": "actual operands at the causal witnesses and all earlier accepted nodes; not a universal error theorem"
+  },
+  "cases": [
+    {
+      "case": "c2_equal",
+    "prompt_id": "natural_language",
+    "disputed_output_index": 14,
+    "causal_origin_prediction_output_index": 2,
+      "disputed_tokens": [
+        57266,
+        264
+      ],
+      "original_common_token_prefix_and_positions_equal": true,
+      "causal_origin_round": 0,
+      "causal_origin_path": [
+        0,
+        4
+      ],
+      "earliest_pre_bf16_fp32_attention": {
+        "path_offset": 1,
+        "node": 4,
+        "layer": 0,
+        "stage": "layer_00.attention_output",
+        "max_abs": 2.2351741790771484e-8
+      },
+      "earlier_accepted_nodes_checked_in_all_36_layers": [
+        {
+          "node": 0,
+          "all_fp32_attention_equal": true
+        }
+      ],
+      "first_materialized_bf16_stage": "layer_01.attention_output",
+      "first_materialized_bf16_unequal_elements": 2,
+      "first_materialized_bf16_total_elements": 4096,
+      "first_materialized_bf16_max_abs_delta": 0.000003814697265625,
+      "bf16_witness_fp32_max_abs_delta": 1.4901161193847656e-8,
+      "identical_q_and_visible_kv": true,
+      "actual_packed_and_serial_roundtrips_exact": true,
+      "fixed_layout_layerwise_isolation": {
+        "other_request_all_stages_bitwise_equal": true,
+        "off_branch_all_stages_bitwise_equal": true
+      },
+      "original_disputed_row_earliest_stage": "layer_02.attention_output",
+      "original_first_historical_cache_difference_layer": 2,
+      "original_logit_witness": {
+        "row": 0,
+        "actual_argmax": 57266,
+        "reference_argmax": 264,
+        "argmax_flipped": true,
+        "logits_inf_delta": 0.25,
+        "reference_top2_margin": 0,
+        "two_delta": 0.5,
+        "reference_winner_vs_actual_winner_gap": 0,
+        "flip_within_error_envelope": true,
+        "large_margin_violation": false,
+        "actual_candidate_logits": [
+          31.5,
+          31.25
+        ],
+        "reference_candidate_logits": [
+          31.375,
+          31.375
+        ]
+      },
+      "identical_round_start_kv_argmax_flip_count": 0,
+      "original_shape_only_q_projection_control": null,
+      "classification": "shape/layout-dependent floating-point drift, propagated through BF16 quantization and cached state; no semantic/address bug found"
+    },
+    {
+      "case": "c2_equal",
+    "prompt_id": "math_logic",
+    "disputed_output_index": 27,
+    "causal_origin_prediction_output_index": 3,
+      "disputed_tokens": [
+        525,
+        4038
+      ],
+      "original_common_token_prefix_and_positions_equal": true,
+      "causal_origin_round": 0,
+      "causal_origin_path": [
+        0,
+        1,
+        8
+      ],
+      "earliest_pre_bf16_fp32_attention": {
+        "path_offset": 2,
+        "node": 8,
+        "layer": 0,
+        "stage": "layer_00.attention_output",
+        "max_abs": 2.9802322387695312e-8
+      },
+      "earlier_accepted_nodes_checked_in_all_36_layers": [
+        {
+          "node": 0,
+          "all_fp32_attention_equal": true
+        },
+        {
+          "node": 1,
+          "all_fp32_attention_equal": true
+        }
+      ],
+      "first_materialized_bf16_stage": "layer_02.attention_output",
+      "first_materialized_bf16_unequal_elements": 1,
+      "first_materialized_bf16_total_elements": 4096,
+      "first_materialized_bf16_max_abs_delta": 1.1920928955078125e-7,
+      "bf16_witness_fp32_max_abs_delta": 1.4901161193847656e-8,
+      "identical_q_and_visible_kv": true,
+      "actual_packed_and_serial_roundtrips_exact": true,
+      "fixed_layout_layerwise_isolation": {
+        "other_request_all_stages_bitwise_equal": true,
+        "off_branch_all_stages_bitwise_equal": true
+      },
+      "original_disputed_row_earliest_stage": "layer_01.attention_output",
+      "original_first_historical_cache_difference_layer": 1,
+      "original_logit_witness": {
+        "row": 0,
+        "actual_argmax": 525,
+        "reference_argmax": 4038,
+        "argmax_flipped": true,
+        "logits_inf_delta": 0.25,
+        "reference_top2_margin": 0.25,
+        "two_delta": 0.5,
+        "reference_winner_vs_actual_winner_gap": 0.25,
+        "flip_within_error_envelope": true,
+        "large_margin_violation": false,
+        "actual_candidate_logits": [
+          34,
+          34
+        ],
+        "reference_candidate_logits": [
+          34,
+          34.25
+        ]
+      },
+      "identical_round_start_kv_argmax_flip_count": 0,
+      "original_shape_only_q_projection_control": null,
+      "classification": "shape/layout-dependent floating-point drift, propagated through BF16 quantization and cached state; no semantic/address bug found"
+    },
+    {
+      "case": "c3_ragged_63_31_47",
+    "prompt_id": "math_logic",
+    "disputed_output_index": 27,
+    "causal_origin_prediction_output_index": 3,
+      "disputed_tokens": [
+        4038,
+        525
+      ],
+      "original_common_token_prefix_and_positions_equal": true,
+      "causal_origin_round": 0,
+      "causal_origin_path": [
+        0,
+        1,
+        8
+      ],
+      "earliest_pre_bf16_fp32_attention": {
+        "path_offset": 2,
+        "node": 8,
+        "layer": 0,
+        "stage": "layer_00.attention_output",
+        "max_abs": 4.470348358154297e-8
+      },
+      "earlier_accepted_nodes_checked_in_all_36_layers": [
+        {
+          "node": 0,
+          "all_fp32_attention_equal": true
+        },
+        {
+          "node": 1,
+          "all_fp32_attention_equal": true
+        }
+      ],
+      "first_materialized_bf16_stage": "layer_13.attention_output",
+      "first_materialized_bf16_unequal_elements": 1,
+      "first_materialized_bf16_total_elements": 4096,
+      "first_materialized_bf16_max_abs_delta": 0.000030517578125,
+      "bf16_witness_fp32_max_abs_delta": 1.1920928955078125e-7,
+      "identical_q_and_visible_kv": true,
+      "actual_packed_and_serial_roundtrips_exact": true,
+      "fixed_layout_layerwise_isolation": {
+        "other_request_all_stages_bitwise_equal": true,
+        "off_branch_all_stages_bitwise_equal": true
+      },
+      "original_disputed_row_earliest_stage": "layer_02.attention_output",
+      "original_first_historical_cache_difference_layer": 2,
+      "original_logit_witness": {
+        "row": 0,
+        "actual_argmax": 4038,
+        "reference_argmax": 525,
+        "argmax_flipped": true,
+        "logits_inf_delta": 0.25,
+        "reference_top2_margin": 0,
+        "two_delta": 0.5,
+        "reference_winner_vs_actual_winner_gap": 0,
+        "flip_within_error_envelope": true,
+        "large_margin_violation": false,
+        "actual_candidate_logits": [
+          34.25,
+          34
+        ],
+        "reference_candidate_logits": [
+          34,
+          34
+        ]
+      },
+      "identical_round_start_kv_argmax_flip_count": 0,
+      "original_shape_only_q_projection_control": null,
+      "classification": "shape/layout-dependent floating-point drift, propagated through BF16 quantization and cached state; no semantic/address bug found"
+    },
+    {
+      "case": "c4_equal",
+    "prompt_id": "natural_language",
+    "disputed_output_index": 14,
+    "causal_origin_prediction_output_index": 2,
+      "disputed_tokens": [
+        57266,
+        264
+      ],
+      "original_common_token_prefix_and_positions_equal": true,
+      "causal_origin_round": 0,
+      "causal_origin_path": [
+        0,
+        4
+      ],
+      "earliest_pre_bf16_fp32_attention": {
+        "path_offset": 1,
+        "node": 4,
+        "layer": 0,
+        "stage": "layer_00.attention_output",
+        "max_abs": 5.960464477539063e-8
+      },
+      "earlier_accepted_nodes_checked_in_all_36_layers": [
+        {
+          "node": 0,
+          "all_fp32_attention_equal": true
+        }
+      ],
+      "first_materialized_bf16_stage": "layer_02.attention_output",
+      "first_materialized_bf16_unequal_elements": 1,
+      "first_materialized_bf16_total_elements": 4096,
+      "first_materialized_bf16_max_abs_delta": 1.1920928955078125e-7,
+      "bf16_witness_fp32_max_abs_delta": 1.4901161193847656e-8,
+      "identical_q_and_visible_kv": true,
+      "actual_packed_and_serial_roundtrips_exact": true,
+      "fixed_layout_layerwise_isolation": {
+        "other_request_all_stages_bitwise_equal": true,
+        "off_branch_all_stages_bitwise_equal": true
+      },
+      "original_disputed_row_earliest_stage": "layer_29.attention_output",
+      "original_first_historical_cache_difference_layer": 29,
+      "original_logit_witness": {
+        "row": 0,
+        "actual_argmax": 57266,
+        "reference_argmax": 264,
+        "argmax_flipped": true,
+        "logits_inf_delta": 0.1875,
+        "reference_top2_margin": 0,
+        "two_delta": 0.375,
+        "reference_winner_vs_actual_winner_gap": 0,
+        "flip_within_error_envelope": true,
+        "large_margin_violation": false,
+        "actual_candidate_logits": [
+          31.5,
+          31.375
+        ],
+        "reference_candidate_logits": [
+          31.375,
+          31.375
+        ]
+      },
+      "identical_round_start_kv_argmax_flip_count": 0,
+      "original_shape_only_q_projection_control": null,
+      "classification": "shape/layout-dependent floating-point drift, propagated through BF16 quantization and cached state; no semantic/address bug found"
+    },
+    {
+      "case": "c4_ragged",
+    "prompt_id": "math_logic",
+    "disputed_output_index": 27,
+    "causal_origin_prediction_output_index": 3,
+      "disputed_tokens": [
+        4038,
+        525
+      ],
+      "original_common_token_prefix_and_positions_equal": true,
+      "causal_origin_round": 0,
+      "causal_origin_path": [
+        0,
+        1,
+        8
+      ],
+      "earliest_pre_bf16_fp32_attention": {
+        "path_offset": 2,
+        "node": 8,
+        "layer": 0,
+        "stage": "layer_00.attention_output",
+        "max_abs": 2.2351741790771484e-8
+      },
+      "earlier_accepted_nodes_checked_in_all_36_layers": [
+        {
+          "node": 0,
+          "all_fp32_attention_equal": true
+        },
+        {
+          "node": 1,
+          "all_fp32_attention_equal": true
+        }
+      ],
+      "first_materialized_bf16_stage": "layer_02.attention_output",
+      "first_materialized_bf16_unequal_elements": 1,
+      "first_materialized_bf16_total_elements": 4096,
+      "first_materialized_bf16_max_abs_delta": 4.76837158203125e-7,
+      "bf16_witness_fp32_max_abs_delta": 2.2351741790771484e-8,
+      "identical_q_and_visible_kv": true,
+      "actual_packed_and_serial_roundtrips_exact": true,
+      "fixed_layout_layerwise_isolation": {
+        "other_request_all_stages_bitwise_equal": true,
+        "off_branch_all_stages_bitwise_equal": true
+      },
+      "original_disputed_row_earliest_stage": "layer_03.attention_output",
+      "original_first_historical_cache_difference_layer": 3,
+      "original_logit_witness": {
+        "row": 0,
+        "actual_argmax": 4038,
+        "reference_argmax": 525,
+        "argmax_flipped": true,
+        "logits_inf_delta": 0.25,
+        "reference_top2_margin": 0,
+        "two_delta": 0.5,
+        "reference_winner_vs_actual_winner_gap": 0,
+        "flip_within_error_envelope": true,
+        "large_margin_violation": false,
+        "actual_candidate_logits": [
+          34.25,
+          34
+        ],
+        "reference_candidate_logits": [
+          34,
+          34
+        ]
+      },
+      "identical_round_start_kv_argmax_flip_count": 0,
+      "original_shape_only_q_projection_control": null,
+      "classification": "shape/layout-dependent floating-point drift, propagated through BF16 quantization and cached state; no semantic/address bug found"
+    },
+    {
+      "case": "c4_ragged",
+    "prompt_id": "long_continuation",
+    "disputed_output_index": 26,
+    "causal_origin_prediction_output_index": 2,
+      "disputed_tokens": [
+        6243,
+        279
+      ],
+      "original_common_token_prefix_and_positions_equal": true,
+      "causal_origin_round": 0,
+      "causal_origin_path": [
+        0,
+        2
+      ],
+      "earliest_pre_bf16_fp32_attention": {
+        "path_offset": 1,
+        "node": 2,
+        "layer": 0,
+        "stage": "layer_00.attention_output",
+        "max_abs": 1.4901161193847656e-8
+      },
+      "earlier_accepted_nodes_checked_in_all_36_layers": [
+        {
+          "node": 0,
+          "all_fp32_attention_equal": true
+        }
+      ],
+      "first_materialized_bf16_stage": "layer_14.attention_output",
+      "first_materialized_bf16_unequal_elements": 1,
+      "first_materialized_bf16_total_elements": 4096,
+      "first_materialized_bf16_max_abs_delta": 0.00000762939453125,
+      "bf16_witness_fp32_max_abs_delta": 5.960464477539063e-8,
+      "identical_q_and_visible_kv": true,
+      "actual_packed_and_serial_roundtrips_exact": true,
+      "fixed_layout_layerwise_isolation": {
+        "other_request_all_stages_bitwise_equal": true,
+        "off_branch_all_stages_bitwise_equal": true
+      },
+      "original_disputed_row_earliest_stage": "layer_00.q_raw",
+      "original_first_historical_cache_difference_layer": 0,
+      "original_logit_witness": {
+        "row": 0,
+        "actual_argmax": 6243,
+        "reference_argmax": 279,
+        "argmax_flipped": true,
+        "logits_inf_delta": 0.25,
+        "reference_top2_margin": 0,
+        "two_delta": 0.5,
+        "reference_winner_vs_actual_winner_gap": 0,
+        "flip_within_error_envelope": true,
+        "large_margin_violation": false,
+        "actual_candidate_logits": [
+          25.125,
+          25
+        ],
+        "reference_candidate_logits": [
+          25.125,
+          25.125
+        ]
+      },
+      "identical_round_start_kv_argmax_flip_count": 0,
+      "original_shape_only_q_projection_control": {
+        "stage": "layer_00.q_raw",
+        "same_selected_input_bitwise": true,
+        "packed_shape": [
+          126,
+          4096
+        ],
+        "reference_shape": [
+          204,
+          4096
+        ],
+        "vanilla_F_linear_reproduces_both_actual_outputs": true,
+        "actual_delta": {
+          "shape": [
+            4096
+          ],
+          "dtype": "torch.bfloat16",
+          "elements": 4096,
+          "bitwise_equal": false,
+          "unequal_elements": 1609,
+          "unequal_fraction": 0.392822265625,
+          "max_abs": 0.001953125,
+          "rms": 0.00014470945461653173,
+          "relative_rms": 0.002646280682722139,
+          "nonfinite_a": 0,
+          "nonfinite_b": 0
+        },
+        "packed_vs_fp64": {
+          "elements": 4096,
+          "max_abs_error": 0.0025497759249333285,
+          "rms_error": 0.00010869856437949425,
+          "relative_rms_error": 0.001987895419954804,
+          "reference_absmax": 0.8099502240750667,
+          "reference_rms": 0.05468022275636893,
+          "max_abs_bound": 0.0001,
+          "relative_rms_bound": 0.0001,
+          "within_fixed_bound": false,
+          "fixed_bound_applicable": false,
+          "fixed_bound_scope": "FP32 attention output before BF16 quantization",
+          "bf16_quantization": {
+            "actual_output_is_bf16": true,
+            "ulp_definition": "max adjacent spacing around FP64-oracle rounded BF16 value",
+            "max_error_in_bf16_ulps": 881.7035207748413,
+            "max_distance_from_nearest_bf16_in_ulps": 882,
+            "nearest_bf16_unequal_elements": 1270,
+            "nearest_rounding_max_abs_error": 0.0013564740750666715
+          }
+        },
+        "reference_vs_fp64": {
+          "elements": 4096,
+          "max_abs_error": 0.0025497759249333285,
+          "rms_error": 0.00011990909705080304,
+          "relative_rms_error": 0.002192915299285911,
+          "reference_absmax": 0.8099502240750667,
+          "reference_rms": 0.05468022275636893,
+          "max_abs_bound": 0.0001,
+          "relative_rms_bound": 0.0001,
+          "within_fixed_bound": false,
+          "fixed_bound_applicable": false,
+          "fixed_bound_scope": "FP32 attention output before BF16 quantization",
+          "bf16_quantization": {
+            "actual_output_is_bf16": true,
+            "ulp_definition": "max adjacent spacing around FP64-oracle rounded BF16 value",
+            "max_error_in_bf16_ulps": 337.7035207748413,
+            "max_distance_from_nearest_bf16_in_ulps": 338,
+            "nearest_bf16_unequal_elements": 1223,
+            "nearest_rounding_max_abs_error": 0.0013564740750666715
+          }
+        },
+        "bf16_projection_scaled_maxabs_and_relative_rms_bound": 0.0078125,
+        "both_within_fixed_bf16_projection_envelope": true
+      },
+      "classification": "shape/layout-dependent floating-point drift, propagated through BF16 quantization and cached state; no semantic/address bug found"
+    }
+  ],
+  "correctness_contract": {
+    "scope": "finite valid model activations, greedy BF16 Qwen3-8B, eager TP1 on the recorded environment",
+    "exact_semantics": [
+      "per-request tokens, prefix, parent-chain visibility, depth and RoPE positions",
+      "request-local page and scratch-slot ownership; no cross-request visible keys",
+      "accepted-only raw all-layer KV copy, immutable history and uncached-anchor invariant",
+      "transaction cleanup/recovery and scratch retirement/reuse"
+    ],
+    "fixed_shape_and_layout": "On the same hardware, software versions and precision flags, repeated identical-state execution and finite other-request/off-branch perturbations must preserve selected bitwise outputs at fixed shape/layout",
+    "numerics": "FP32 TILE64 multiply/reduction/online-softmax; FP32 attention scaled maxabs and relative RMS each <=1e-4 against independently selected CPU FP64 operands; BF16 quantization is separate",
+    "gemm_shape_control": "separate predeclared scaled/RMS envelope 2^-7 for the isolated Q projection; empirical qualification, not a universal forward-error theorem or elementwise ULP guarantee",
+    "argmax_witness": "margin <= 2*logits_inf_delta is only a necessary consistency check; causal operator controls provide the numerical attribution",
+    "not_guaranteed": [
+      "cross-layout/shape bitwise logits or complete AR token sequences",
+      "strict lossless multi-request decoding relative to a separately executed AR schedule",
+      "arbitrary sampling-distribution equivalence",
+      "NaN/Inf valid masked nodes: 0*NaN can propagate",
+      "unmeasured models, precision modes, TP, CUDA graphs or hardware without requalification"
+    ]
+  },
+  "native_exit_139": {
+    "status": "known anomaly, not reproduced",
+    "original_harness_retry_exit_code": 0,
+    "retry_cases": [
+      "c2_equal",
+      "c3_ragged_63_31_47",
+      "c4_equal",
+      "c4_ragged"
+    ],
+    "warmup": 1,
+    "repeats": 1,
+    "retry_strict_requests_checked": 13,
+    "retry_strict_exact_requests": 7,
+    "same_six_mismatches_reproduced": true,
+    "lifecycle_isolation_raw_copy_and_recovery_passed": true,
+    "latest_full_diagnostic_exit_code": 0,
+    "root_cause": "unlocalized; no attribution to driver, hardware or attention kernel; kernel logs unavailable"
+  },
+  "unit_tests": {
+    "new_cpu_test_cases": 28,
+    "new_cpu_test_cases_passed": 28,
+    "clean_commit_full_cpu_cuda_suite": {
+      "validated_code_revision": "a64f38458b91e3411a7d1bf1abb066874f10817e",
+      "checkout": "/tmp/jetspec-phase31-numeric-LsXcvr/repo",
+      "command": "RUN_JETSPEC_PACKED_GPU_TESTS=1 /root/autodl-tmp/venvs/jetspec-phase0/bin/python -m unittest discover -s tests -v",
+      "exit_code": 0,
+      "test_cases": 83,
+      "passed": 83,
+      "skipped": 0,
+      "failures": 0,
+      "errors": 0,
+      "elapsed_s": 3.294,
+      "worktree_clean_after_run": true,
+      "final_amendment_scope": "qualification JSON test results only; all validated Python sources unchanged"
+    },
+    "preserved_dirty_worktree": "legacy cleanup-wrapper test still has its previously documented four failing subtests; user runtime.py changes intentionally untouched and excluded from commit"
+  },
+  "raw_artifacts": {
+    "diagnostic": {
+      "path": "/root/autodl-tmp/benchmarks/jetspec-phase31-numerics/qualification-final.json",
+      "sha256": "b4794a8a84395b4de15d4fbd4d02ef284919f6e104f581ecde72436800b05ea9"
+    },
+    "exit139_retry": {
+      "path": "/root/autodl-tmp/benchmarks/jetspec-phase31-numerics/crash-repro.json",
+      "sha256": "137bce513db32f44ae6ed2a9fe4fe8336622d08029d0b4c48e95ff79bf406adf"
+    },
+    "prior_baseline": {
+      "path": "/root/autodl-tmp/benchmarks/jetspec-phase31/final-stable.json",
+      "sha256": "4f85f4ea37c91655493e3678eeb0842c99334c4322a175956c9274bf0fc29a33"
+    }
+  }
+}
