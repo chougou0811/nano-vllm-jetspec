@@ -1,0 +1,392 @@
+{
+  "kind": "fresh isolated installation and serving smoke, not a performance benchmark",
+  "passed": true,
+  "tested_source": "/root/autodl-tmp/chunked-final-mDRwZq",
+  "base_commit": "c0d8a9a",
+  "production_sha256": "038fb0d746882451f915c3d028778198e508d488b0c06a8eba44354d726fa57c",
+  "fresh_installed_source_fingerprint_matches_qualification": true,
+  "installed_official_jetspec_source": "/root/autodl-tmp/jetspec-install-check-jIcTYv/venv/lib/python3.12/site-packages/jetspec/__init__.py",
+  "python": "3.12.3",
+  "system_site_packages": false,
+  "execution_cwd": "/tmp",
+  "pip_check": "No broken requirements found.",
+  "critical_pins": {
+    "torch": "2.8.0+cu128",
+    "triton": "3.4.0",
+    "transformers": "4.57.6",
+    "huggingface-hub": "0.36.2"
+  },
+  "installation_commands": [
+    "python3.12 -m venv .venv",
+    "python -m pip install --upgrade pip",
+    "python -m pip install 'torch==2.8.0' --index-url https://download.pytorch.org/whl/cu128",
+    "python -m pip install -c requirements/constraints-cu128.txt -e '.[jetspec]'",
+    "python -m pip check"
+  ],
+  "doctor_cpu": {
+    "ok": true,
+    "checks": [
+      {
+        "check": "python",
+        "status": "pass",
+        "detail": "3.12.3"
+      },
+      {
+        "check": "platform",
+        "status": "pass",
+        "detail": "linux; qualified on Linux / Python 3.12"
+      },
+      {
+        "check": "torch",
+        "status": "pass",
+        "detail": {
+          "installed": "2.8.0+cu128",
+          "qualified": "2.8.0+cu128"
+        }
+      },
+      {
+        "check": "triton",
+        "status": "pass",
+        "detail": {
+          "installed": "3.4.0",
+          "qualified": "3.4.0"
+        }
+      },
+      {
+        "check": "transformers",
+        "status": "pass",
+        "detail": {
+          "installed": "4.57.6",
+          "qualified": "4.57.6"
+        }
+      },
+      {
+        "check": "huggingface-hub",
+        "status": "pass",
+        "detail": {
+          "installed": "0.36.2",
+          "qualified": "0.36.2"
+        }
+      },
+      {
+        "check": "import:torch",
+        "status": "pass",
+        "detail": "/root/autodl-tmp/jetspec-install-check-jIcTYv/venv/lib/python3.12/site-packages/torch/__init__.py"
+      },
+      {
+        "check": "import:triton",
+        "status": "pass",
+        "detail": "/root/autodl-tmp/jetspec-install-check-jIcTYv/venv/lib/python3.12/site-packages/triton/__init__.py"
+      },
+      {
+        "check": "import:transformers",
+        "status": "pass",
+        "detail": "/root/autodl-tmp/jetspec-install-check-jIcTYv/venv/lib/python3.12/site-packages/transformers/__init__.py"
+      },
+      {
+        "check": "import:jetspec",
+        "status": "pass",
+        "detail": "/root/autodl-tmp/jetspec-install-check-jIcTYv/venv/lib/python3.12/site-packages/jetspec/__init__.py"
+      },
+      {
+        "check": "import:nanovllm",
+        "status": "pass",
+        "detail": "/root/autodl-tmp/chunked-final-mDRwZq/nanovllm/__init__.py"
+      },
+      {
+        "check": "fork_serving_api",
+        "status": "pass",
+        "detail": "LLM.configure_jetspec must exist; installing upstream nano-vLLM is not sufficient"
+      },
+      {
+        "check": "official_jetspec_revision",
+        "status": "pass",
+        "detail": {
+          "installed": "2c7b3fae75690dfe9a188a37d7fdfd43ee0e032f",
+          "qualified": "2c7b3fae75690dfe9a188a37d7fdfd43ee0e032f"
+        }
+      },
+      {
+        "check": "trained_draft_api",
+        "status": "pass",
+        "detail": "official model and adapter import successfully"
+      },
+      {
+        "check": "flash_attention",
+        "status": "pass",
+        "detail": "absent (expected); ordinary attention requires enforce_eager=True with the slower SDPA fallback"
+      },
+      {
+        "check": "checkpoint_pair",
+        "status": "pass",
+        "detail": {
+          "target_layers": 36,
+          "target_layer_ids": [
+            1,
+            9,
+            17,
+            25,
+            33
+          ],
+          "block_size": 16,
+          "note": "config/shard presence checks only; not weight hashing or numerical qualification"
+        }
+      },
+      {
+        "check": "hf_config_dtype",
+        "status": "pass",
+        "detail": "torch.bfloat16"
+      }
+    ],
+    "scope": "installation preflight, not a GPU correctness/performance qualification"
+  },
+  "doctor_cuda": {
+    "ok": true,
+    "checks": [
+      {
+        "check": "python",
+        "status": "pass",
+        "detail": "3.12.3"
+      },
+      {
+        "check": "platform",
+        "status": "pass",
+        "detail": "linux; qualified on Linux / Python 3.12"
+      },
+      {
+        "check": "torch",
+        "status": "pass",
+        "detail": {
+          "installed": "2.8.0+cu128",
+          "qualified": "2.8.0+cu128"
+        }
+      },
+      {
+        "check": "triton",
+        "status": "pass",
+        "detail": {
+          "installed": "3.4.0",
+          "qualified": "3.4.0"
+        }
+      },
+      {
+        "check": "transformers",
+        "status": "pass",
+        "detail": {
+          "installed": "4.57.6",
+          "qualified": "4.57.6"
+        }
+      },
+      {
+        "check": "huggingface-hub",
+        "status": "pass",
+        "detail": {
+          "installed": "0.36.2",
+          "qualified": "0.36.2"
+        }
+      },
+      {
+        "check": "import:torch",
+        "status": "pass",
+        "detail": "/root/autodl-tmp/jetspec-install-check-jIcTYv/venv/lib/python3.12/site-packages/torch/__init__.py"
+      },
+      {
+        "check": "import:triton",
+        "status": "pass",
+        "detail": "/root/autodl-tmp/jetspec-install-check-jIcTYv/venv/lib/python3.12/site-packages/triton/__init__.py"
+      },
+      {
+        "check": "import:transformers",
+        "status": "pass",
+        "detail": "/root/autodl-tmp/jetspec-install-check-jIcTYv/venv/lib/python3.12/site-packages/transformers/__init__.py"
+      },
+      {
+        "check": "import:jetspec",
+        "status": "pass",
+        "detail": "/root/autodl-tmp/jetspec-install-check-jIcTYv/venv/lib/python3.12/site-packages/jetspec/__init__.py"
+      },
+      {
+        "check": "import:nanovllm",
+        "status": "pass",
+        "detail": "/root/autodl-tmp/chunked-final-mDRwZq/nanovllm/__init__.py"
+      },
+      {
+        "check": "fork_serving_api",
+        "status": "pass",
+        "detail": "LLM.configure_jetspec must exist; installing upstream nano-vLLM is not sufficient"
+      },
+      {
+        "check": "official_jetspec_revision",
+        "status": "pass",
+        "detail": {
+          "installed": "2c7b3fae75690dfe9a188a37d7fdfd43ee0e032f",
+          "qualified": "2c7b3fae75690dfe9a188a37d7fdfd43ee0e032f"
+        }
+      },
+      {
+        "check": "trained_draft_api",
+        "status": "pass",
+        "detail": "official model and adapter import successfully"
+      },
+      {
+        "check": "flash_attention",
+        "status": "pass",
+        "detail": "absent (expected); ordinary attention requires enforce_eager=True with the slower SDPA fallback"
+      },
+      {
+        "check": "checkpoint_pair",
+        "status": "pass",
+        "detail": {
+          "target_layers": 36,
+          "target_layer_ids": [
+            1,
+            9,
+            17,
+            25,
+            33
+          ],
+          "block_size": 16,
+          "note": "config/shard presence checks only; not weight hashing or numerical qualification"
+        }
+      },
+      {
+        "check": "hf_config_dtype",
+        "status": "pass",
+        "detail": "torch.bfloat16"
+      },
+      {
+        "check": "cuda",
+        "status": "pass",
+        "detail": {
+          "device": "NVIDIA GeForce RTX 5090",
+          "torch_cuda": "12.8",
+          "total_bytes": 33668988928
+        }
+      }
+    ],
+    "scope": "installation preflight, not a GPU correctness/performance qualification"
+  },
+  "unit_tests": {
+    "cpu_only": {
+      "cuda_visible_devices": "",
+      "total": 249,
+      "passed": 231,
+      "skipped": 18,
+      "exit_code": 0
+    },
+    "gpu": {
+      "RUN_JETSPEC_PACKED_GPU_TESTS": "1",
+      "total": 249,
+      "passed": 249,
+      "skipped": 0,
+      "exit_code": 0
+    }
+  },
+  "smoke": {
+    "arguments": {
+      "prefill_chunk_size": 8,
+      "max_prefill_tokens": 16,
+      "max_tokens": 32
+    },
+    "exit_code": 0,
+    "result": {
+      "kind": "serving_smoke_not_benchmark",
+      "steps": 14,
+      "torch": "2.8.0+cu128",
+      "target": "/root/autodl-tmp/models/modelscope-Qwen3-8B",
+      "draft": "/root/autodl-tmp/models/jetspec-qwen3-8b-020a198caefde24a2891ad827cba7fb977ccdc36",
+      "exactly_once_delivery": true,
+      "requests": [
+        {
+          "request_id": "request-0",
+          "token_ids": [
+            59604,
+            13,
+            151645
+          ],
+          "text": "Paris."
+        },
+        {
+          "request_id": "request-1",
+          "token_ids": [
+            785,
+            12884,
+            7952,
+            6303,
+            1576,
+            34615,
+            304,
+            279,
+            9237,
+            594,
+            16566,
+            44477,
+            23327,
+            92859,
+            315,
+            3100,
+            11,
+            1075,
+            6303,
+            11,
+            803,
+            13444,
+            1091,
+            5021,
+            92859,
+            11,
+            1741,
+            438,
+            2518,
+            11,
+            4152,
+            311
+          ],
+          "text": "The sky appears blue because molecules in the Earth's atmosphere scatter shorter wavelengths of light, like blue, more effectively than longer wavelengths, such as red, due to"
+        }
+      ]
+    }
+  },
+  "source_files_sha256": {
+    "pyproject.toml": "e4607fc4b7efc3125d57b658dcc6561cb7b6afb1f87a2dacbddd126dcd2c049b",
+    "requirements/constraints-cu128.txt": "a4dcaaa0eeb37d5a59615d2682bb52f43dfcb4b85c510c3178c9f20f05da3951",
+    "tools/check_environment.py": "e88a5495d55999f1ae8f8e858718a03b075ddaa093df32f2222ab54e53ae2ab5",
+    "examples/jetspec_serving.py": "1f90aebd7a6ee631ace0520a92bf5e3224404610ec53a6b42e769d462d5c7d32"
+  },
+  "raw_artifacts": {
+    "install-report.json": {
+      "path": "/root/autodl-tmp/jetspec-install-check-jIcTYv/install-report.json",
+      "sha256": "48963cd43660a0faa15d0f97dd0c1d5296cd63dadbab5252447d6cf15309614c"
+    },
+    "doctor-cpu.json": {
+      "path": "/root/autodl-tmp/jetspec-install-check-jIcTYv/doctor-cpu.json",
+      "sha256": "3dd4a46d10e82025a2d73f3afd1dc2a0d7f55a7d038efdc85fc3a5e220fd9424"
+    },
+    "doctor-gpu.json": {
+      "path": "/root/autodl-tmp/jetspec-install-check-jIcTYv/doctor-gpu.json",
+      "sha256": "e62a66d446fc95e4e7ee9933ffe33d2528fa3170d29af0a1829cb99af8d5f02c"
+    },
+    "units-fresh-cpu.log": {
+      "path": "/root/autodl-tmp/jetspec-install-check-jIcTYv/units-fresh-cpu.log",
+      "sha256": "f66cdbd77ef5049b608ad0b3eaadd5a5abcc095df09bde4f9c75aab8a2f93a93"
+    },
+    "units-fresh-gpu.log": {
+      "path": "/root/autodl-tmp/jetspec-install-check-jIcTYv/units-fresh-gpu.log",
+      "sha256": "72015fbe1b27379b13f00d50c6bf42b507168c89d9151c73e908a1170c2d741c"
+    },
+    "serving-smoke.json": {
+      "path": "/root/autodl-tmp/jetspec-install-check-jIcTYv/serving-smoke.json",
+      "sha256": "8762bf9d3abf1950be67644278f07084f309883594eac2f186da6d4ca4f7e6cb"
+    },
+    "pip-check.log": {
+      "path": "/root/autodl-tmp/jetspec-install-check-jIcTYv/pip-check.log",
+      "sha256": "9261363b733079a641c2e4cc9bc46ffa1d8336945a87f807b6cf68847dbc9b09"
+    }
+  },
+  "limitations": [
+    "GPU smoke reused existing local Target/Draft weights; public revisions/config availability was verified, not a new full weight download/hash comparison.",
+    "CLI proves terminal consistency/EOS/output-cap handling and successful engine close; page-level allocator cleanup is separately asserted by chunked_prefill_qualification.json and unit tests.",
+    "Raw installation logs are local provenance; supported fresh-clone reproduction uses README commands and generates new artifacts.",
+    "The user-owned dirty legacy runtime.py was preserved and excluded from this tested/committed source snapshot."
+  ]
+}

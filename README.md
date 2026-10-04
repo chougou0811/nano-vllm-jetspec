@@ -2,50 +2,288 @@
 <img width="300" src="assets/logo.png">
 </p>
 
-<p align="center">
-<a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="GeeeekExplorer%2Fnano-vllm | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
+# nano-vLLM + JetSpec
 
-# Nano-vLLM
+An experimental inference-serving fork of
+[GeeeekExplorer/nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm), integrating
+the trained causal-parallel draft head and tree algorithms from
+[hao-ai-lab/JetSpec](https://github.com/hao-ai-lab/JetSpec). The upstream authors
+retain credit for nano-vLLM and JetSpec; this repository implements their
+integration, paged KV lifetime/commit, packed multi-request verification,
+synchronous Continuous Batching and profile-driven serving optimizations.
 
-A lightweight vLLM implementation built from scratch.
+Current qualified JetSpec scope: **Qwen3-8B + the pinned JetSpec Qwen3-8B head,
+greedy BF16, one NVIDIA GPU, TP=1, eager execution**. It includes ragged packed
+Target verification, runner-owned reusable scratch, request-local accepted-only
+KV commit, Batched Draft, dynamic arrival/cancel, chunked prefill and chunked
+recompute preemption/resume.
+It is not an HTTP server. JetSpec prefix sharing, sampling, TP and CUDA Graph
+execution are not qualified. The ordinary nano-vLLM path retains its separate
+features; do not attribute its CUDA Graph/TP support to the JetSpec path.
 
-## Key Features
-
-* 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
-* 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
+See the [current serving API](#chunked-prefill-and-recompute) and
+[Phase 4 measurements](#jetspec-phase-4-profile-driven-serving-optimization).
+Older phase sections below are historical snapshots, not a cumulative list
+of current limitations or guarantees.
 
 ## Installation
 
+Use this fork, **not** `pip install git+https://github.com/GeeeekExplorer/nano-vllm.git`.
+The latter installs upstream without these JetSpec APIs. The reproducible setup
+below targets Linux, Python 3.12 and the CUDA 12.8 PyTorch wheel. GPU tests were
+run on RTX 5090 (32 GB); smaller cards may need lower memory/workload limits or
+may not fit both models. A CUDA-capable NVIDIA driver is required; inference
+does not require compiling FlashAttention or installing `nvcc`.
+Package installation requires Python 3.11–3.12 (serving cleanup uses Python
+3.11's exception notes); Python 3.12 is the reference-tested version.
+
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+git clone https://github.com/chougou0811/nano-vllm-jetspec.git
+cd nano-vllm-jetspec
+# For a repeatable experiment, checkout and record the commit being tested.
+git rev-parse HEAD
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install 'torch==2.8.0' --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -c requirements/constraints-cu128.txt -e '.[jetspec]'
+python -m pip check
+python tools/check_environment.py --strict-pins
 ```
 
-## Model Download
+The `[jetspec]` extra installs official JetSpec at commit
+`2c7b3fae75690dfe9a188a37d7fdfd43ee0e032f`; Git and access to GitHub are needed.
+The tested stack is torch `2.8.0+cu128`, Triton `3.4.0`, transformers `4.57.6`,
+and huggingface-hub `0.36.2`. The constraints file pins the compatibility-critical
+dependencies, **not every transitive wheel or platform artifact**. Other CUDA
+builds/hardware require separate validation; do not claim an exact reproduction
+just because the Python source revision matches. Import failures after upgrading
+transformers often indicate its internal model/cache API changed: use a fresh
+environment and the constraints, rather than mixing unrelated environments.
 
-To download the model weights manually, use the following command:
+**FlashAttention is optional and absent in the qualified environment.** Ordinary
+attention uses the existing slower PyTorch SDPA fallback when it is absent;
+JetSpec uses SDPA prefill/Draft and custom Triton tree verification. This avoids
+the common fresh-install failure caused by building `flash-attn` before torch
+and CUDA build prerequisites exist. For an explicitly separate FlashAttention
+experiment, install a wheel compatible with your GPU/torch/CUDA or build it
+after installing its documented compiler/build prerequisites. The optional
+`[flash-attn]` extra is not a qualified performance configuration; report the
+actual version/backend and rerun correctness and matched baselines.
+Use `enforce_eager=True` for the ordinary path without FlashAttention as well:
+its correctness fallback has host-side length reads and is not CUDA-Graph-safe.
+
+## Pinned model download
+
+The Target and Draft are a trained pair: do **not** substitute Qwen3-0.6B for
+Qwen3-8B when using this head. The engine takes local model directories, not
+Hub IDs. Download both pinned revisions with the installed `hf` CLI:
+
 ```bash
-huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
-  --local-dir-use-symlinks False
+hf download Qwen/Qwen3-8B \
+  --revision b968826d9c46dd6066d109eabc6255188de91218 \
+  --local-dir models/Qwen3-8B
+hf download JetSpec/jetspec-qwen3-8b \
+  --revision 020a198caefde24a2891ad827cba7fb977ccdc36 \
+  --local-dir models/jetspec-qwen3-8b
+python tools/check_environment.py --strict-pins --require-cuda \
+  --target models/Qwen3-8B --draft models/jetspec-qwen3-8b
 ```
 
-## Quick Start
+Both repositories are public; authentication/network mirrors are environment
+choices. Preserve the same revisions and tokenizer when using a mirror. Weights
+are not committed here, and the historical machine-local model directories in
+qualification JSON are provenance, not paths that exist in a fresh clone.
+The preflight checks installed source/imports, config compatibility and shard
+presence; it does not hash all weights or certify GPU numerics.
 
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
+## Reproducible smoke and tests
+
+Run the portable serving example from the repository root. It uses the public
+add/step API with mixed tree budgets and checks exactly-once incremental output
+against each terminal output. It does not depend on private oracle artifacts:
+
+```bash
+python examples/jetspec_serving.py \
+  --target models/Qwen3-8B --draft models/jetspec-qwen3-8b \
+  --max-tokens 32 --output artifacts/serving-smoke.json
+python -m unittest discover -s tests -v
+RUN_JETSPEC_PACKED_GPU_TESTS=1 python -m unittest discover -s tests -v
+```
+
+The new chunked-prefill harness is also portable and generates its prompt
+corpus locally with the pinned tokenizer. Its standard-library self-test needs
+neither torch nor a GPU; trained qualification and timing are separate modes:
+
+```bash
+python benchmarks/jetspec_chunked_prefill.py --mode self-test
+python benchmarks/jetspec_chunked_numeric_diagnostic.py \
+  --target models/Qwen3-8B --draft models/jetspec-qwen3-8b \
+  --output artifacts/chunked-numeric-diagnostic.json
+python benchmarks/jetspec_chunked_prefill.py --mode qualify \
+  --target models/Qwen3-8B --draft models/jetspec-qwen3-8b \
+  --numeric-diagnostic artifacts/chunked-numeric-diagnostic.json \
+  --output artifacts/chunked-qualification.json
+python benchmarks/jetspec_chunked_prefill.py --mode benchmark \
+  --target models/Qwen3-8B --draft models/jetspec-qwen3-8b \
+  --concurrencies 1,4,8 --outputs 128,512 --chunks 64,256,512 \
+  --warmup 1 --repeats 1 --output artifacts/chunked-benchmark.json
+```
+
+These are commands to run, not an assertion that a different GPU/environment
+will pass the same numerical gates or reproduce the recorded speed. Increase
+repeats for performance conclusions; short single samples are sanity checks.
+Qualification requires a diagnostic generated with the same production source,
+instrumentation, checkpoint manifests and GPU environment. Its hard gates are
+independent same-shape chronological KV/taps/logit equality, causal/request
+isolation, lifecycle/cleanup and a separate FP32 roundoff control. Cross-shape
+BF16 errors and argmax changes are reported, not forced to match tokens. The
+earlier empirical `2^-6` envelope is not a universal accumulated-error bound
+for a 36-layer model; exceeding it is retained as diagnostic evidence rather
+than hidden by increasing the tolerance.
+
+The unit suite uses small synthetic models/tensors, not downloaded 8B weights.
+Small CUDA model/stream tests run automatically when CUDA is available; the
+packed-attention GPU sweep additionally requires `RUN_JETSPEC_PACKED_GPU_TESTS=1`.
+Passing imports or unit tests is not a substitute for the trained-model smoke and
+numerical qualification. `--help` on either new tool needs no GPU or weights.
+The smoke defaults to `gpu_memory_utilization=0.75` to leave space for the Draft,
+Target features and transient allocations; the Target KV allocator does not
+model all CUDA memory. Adjust this and context/concurrency for your device.
+Only one engine process should use the ordinary runner's fixed local distributed
+port at a time. Always close the engine (`exit()` in a `finally` block).
+
+Frozen `benchmarks/jetspec_phase*.py` scripts and their JSON reports document
+earlier experiments. Some defaults point to the original machine and some modes
+require the original oracle or raw diagnostic artifacts. Their recorded hashes
+must not be silently rewritten. Supply explicit `--target`, `--draft`, `--repo`,
+`--oracle`/`--original` as required by each script's `--help`; historical oracle
+artifacts are **not included** in a GitHub clone. The portable smoke above is
+the supported fresh-clone entry point, not a claim that every historical trace
+can be regenerated without its inputs. Phase 4 speedups compare against this
+fork's Phase 3.2 commit, not a current optimized vLLM installation.
+
+## Chunked prefill and recompute
+
+The default Continuous Batching mode now runs bounded request-local prompt
+chunks **between** speculative generation rounds. This is scheduling
+interleaving, not simultaneous CUDA-stream execution or one mixed
+prefill/tree-verification forward. Target verification remains one ragged
+packed batch per generation round; the validated batch transaction and shared
+Tree Scratch continue to own speculative verification/commit.
+
 ```python
 from nanovllm import LLM, SamplingParams
-llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
-sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-prompts = ["Hello, Nano-vLLM."]
-outputs = llm.generate(prompts, sampling_params)
-outputs[0]["text"]
+
+llm = LLM("models/Qwen3-8B", enforce_eager=True, tensor_parallel_size=1,
+          max_num_seqs=4, max_model_len=4096, max_num_batched_tokens=4096,
+          gpu_memory_utilization=0.75)
+try:
+    llm.configure_jetspec("models/jetspec-qwen3-8b",
+                         enable_chunked_prefill=True, prefill_chunk_size=256,
+                         max_prefill_tokens=512)
+    llm.add_request("Explain speculative decoding.",
+                    SamplingParams(temperature=0, max_tokens=128),
+                    request_id="first", tree_budget=63)
+    while not llm.is_finished():
+        llm.step()
+        report = llm.last_step_info
+        for event in report["events"]:
+            # kind=tokens is a delta; finished/error/cancelled contain a full
+            # output snapshot. Do not append the terminal snapshot a second time.
+            print(event["request_id"], event["kind"], event["token_ids"])
+        # report["prefill_chunks"] records request, start/end, total,
+        # is_recompute and completion; new requests/cancels may be submitted here.
+        if report["blocked"]:
+            raise RuntimeError(report["blocked_reason"])  # Or back off/retry if externally held pages may return.
+    llm.disable_jetspec()
+finally:
+    llm.exit()
 ```
 
-## Benchmark
+`max_prefill_tokens` is the aggregate **new prompt/recompute tokens per scheduler
+step**, not a limit on total prompt length. Its chunk-mode default is
+`min(512, max_num_batched_tokens)`. `prefill_chunk_size` (default 256) is each
+request's per-step quantum, capped by the remaining prefill budget. The separate
+packed-verification budget is still `max_num_batched_tokens`: these two budgets
+are not a single combined forward size. Existing decoder residents are serviced
+first; a request that becomes ready during prefill can join a subsequent
+verification. Partial prefills count toward `max_num_seqs` and rotate fairly;
+FIFO admission is bounded by `max_admissions_per_step` (default 2).
 
-See `bench.py` for benchmark.
+Each partial owns private canonical pages, an absolute processed-token cursor,
+and ordered Target taps. Attention sees its own cached prefix plus the causal
+part of the current chunk; RoPE positions do not reset at chunk boundaries.
+The same selected layers are concatenated for every token. Partial taps are
+never passed to Draft as if the prompt were complete. Completing initial
+prefill samples exactly one anchor, then transfers KV/features ownership into
+the ordinary JetSpec request. Completing recompute reconstructs
+`committed_tokens[:-1]`, restores the **existing** uncached anchor and output
+cursor, and emits no old tokens again. At the completed-round boundary:
+`KV length == feature length == committed tokens - 1`.
+
+Cancellation or a failed chunk fences queued writes before releasing its pages.
+Allocation grows incrementally while preserving resident decode capacity;
+under pressure younger partial work can be discarded/requeued. The saved
+committed snapshot and delivered-output cursor survive recompute retries.
+After a partial/recompute eviction, an admission fence pauses younger new
+admissions until the oldest retried prefix becomes READY. Existing residents
+continue decoding; sustained short arrivals cannot repeatedly displace that
+unfinished prefix. The fence is removed on promotion or termination.
+Chunking removes the old "recompute prefix exceeds one prefill budget" limit,
+but it cannot make a prefix fit a physically insufficient KV pool or account
+for all non-KV CUDA allocations.
+
+For an explicit dense/nonchunked control use
+`enable_chunked_prefill=False` (the smoke CLI: `--no-chunked-prefill`); its old
+single-step prompt/recompute budget restriction remains intentional. The manual
+`create_request`/`resume` runtime APIs also remain dense; incremental serving
+uses `begin_prefill`/`prefill_step`/`cancel_prefill` internally. Chunk shapes can
+change BF16 rounding, so cross-shape token bitwise identity is not promised:
+retain the Phase 3.1/3.2 finite-input numerical and isolation/commit contract.
+Chunking is intended to bound long-prompt interference and enable budgeted
+recompute, not a claim of universal throughput improvement.
+
+The initial chunk backend gathers **one layer's** canonical history at a time
+and uses SDPA; it does not retain a second all-layer dense KV cache. Repeated
+gathers and small forwards still cost time. Target features append into a
+prefix-sized buffer, and promotion transfers that buffer into the existing
+capacity-managed decoding state without concatenating the whole history.
+
+### Qualification evidence
+
+- [Fresh installation](benchmarks/chunked_prefill_installation.json): isolated
+  Python 3.12 environment, pinned official JetSpec installed from GitHub,
+  `pip check` and strict CPU/CUDA preflight passed. From outside the checkout:
+  249/249 GPU tests; 231 CPU tests passed with 18 CUDA skips. The trained serving
+  smoke used existing local weights, chunk=8/budget=16, and exercised both EOS
+  and output-cap termination with exactly-once delivery.
+- [Trained qualification](benchmarks/chunked_prefill_qualification.json): five
+  chunk plans (including single-token, page-boundary and irregular splits)
+  match independent same-shape KV/taps/Target logits bytewise. Historical KV,
+  cross-request isolation, dynamic arrival, partial cancellation and three-page
+  pressure/recompute passed; final allocator cleanup was asserted.
+- [Required numeric control](benchmarks/chunked_prefill_numeric_diagnostic.json):
+  P33/chunk1 first differs at layer-0 Q GEMM with identical input; the independent
+  FP32 control passes, with final-logit relative RMS `1.08e-6`.
+- [Additional stress/replay](benchmarks/chunked_prefill_stress_diagnostic.json):
+  the repeated synthetic P273 prompt split as `[7,63,1,129,73]` has **substantial**
+  BF16 shape sensitivity (tap relative RMS `0.597`, Target logits `0.243`).
+  Same-shape independent results remain exact; final FP32 logit RMS falls to
+  `1.26e-5`. Some FP32 intermediate metrics nevertheless exceed the additional
+  `2e-4` empirical envelope: that negative result is retained, not relabeled a
+  pass. A same-input layer-16 replay isolates amplification of inherited
+  roundoff in an MLP-sensitive region. This is not a model-quality certification
+  or a universal cross-shape error bound. The explicit nonchunked control remains
+  available.
+
+## Upstream ordinary-AR example and historical benchmark
+
+The upstream `example.py` and `bench.py` illustrate ordinary nano-vLLM (edit their
+model paths and use `enforce_eager=True` for the no-FlashAttention setup above).
+The following table is retained as an **upstream**
+measurement, not a JetSpec result or a promise for this fork's SDPA fallback.
+
 
 **Test Configuration:**
 - Hardware: RTX 4070 Laptop (8GB)
@@ -60,7 +298,7 @@ See `bench.py` for benchmark.
 | vLLM           | 133,966     | 98.37    | 1361.84               |
 | Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
 
-## Experimental JetSpec integration
+## Historical Phase 1–3.0: single-request JetSpec integration
 
 `LLM.generate_jetspec(prompt, draft_model, tree_backend="paged")` is an opt-in
 greedy Qwen3 path. It currently requires one request, TP=1, eager execution,
@@ -271,6 +509,11 @@ implemented in this numerical qualification.
 
 ## JetSpec Phase 3.2: Continuous Batching
 
+This section records the frozen Phase 3.2 (`7bcb754`) dense-prefill baseline.
+For current defaults and chunked prefill/recompute, use the
+[current serving API](#chunked-prefill-and-recompute) above; Phase 4 also
+supersedes the request-local Draft limitation described here.
+
 `LLM.configure_jetspec()` routes the normal engine `add_request`, `step`,
 `is_finished` and `cancel_request` API through `JetSpecScheduler`. This is
 nano-vLLM's synchronous serving event loop: clients may submit or cancel
@@ -409,6 +652,10 @@ attention alone. Batched Draft, fewer host synchronizations and bounded
 batched/chunked prefill are the next candidates, not implemented in this phase.
 
 ## JetSpec Phase 4: profile-driven serving optimization
+
+Historical measurements for commits `ee36b82` / `c0d8a9a`, before chunked
+prefill/recompute. Their dense-prefill configuration and recorded results are
+retained unchanged; current default scheduling is described above.
 
 `configure_jetspec(..., optimization="serving")` now enables grouped Draft,
 lightweight round decisions and capacity-managed Target features. Use

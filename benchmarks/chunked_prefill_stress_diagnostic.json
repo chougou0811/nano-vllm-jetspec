@@ -1,0 +1,636 @@
+{
+  "kind": "additional worst-shape numerical stress and bounded same-input replay",
+  "plan": [
+    7,
+    63,
+    1,
+    129,
+    73
+  ],
+  "source": {
+    "nano_source": "/root/autodl-tmp/chunked-final-mDRwZq/nanovllm/__init__.py",
+    "jetspec_source": "/root/autodl-tmp/projects/JetSpec/jetspec/__init__.py",
+    "production_sha256": "038fb0d746882451f915c3d028778198e508d488b0c06a8eba44354d726fa57c",
+    "script_sha256": "1e42a4d231649b24b56e73bc2a3d4f483cf7e229cd8f46092130a5c9e9d5f4a6"
+  },
+  "models": {
+    "target": {
+      "path": "/root/autodl-tmp/models/modelscope-Qwen3-8B",
+      "files": {
+        "config.json": {
+          "size": 728,
+          "mtime_ns": 1790498816170667300,
+          "sha256": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30"
+        },
+        "configuration.json": {
+          "size": 73,
+          "mtime_ns": 1790498816138669300,
+          "sha256": "f888421726665e8a84b738eed42a64875aed79de8be7daade851ac8bf4c0cef9"
+        },
+        "generation_config.json": {
+          "size": 239,
+          "mtime_ns": 1790498816446648800,
+          "sha256": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2"
+        },
+        "model-00001-of-00005.safetensors": {
+          "size": 3996250744,
+          "mtime_ns": 1790501085198157000
+        },
+        "model-00002-of-00005.safetensors": {
+          "size": 3993160032,
+          "mtime_ns": 1790500786760430600
+        },
+        "model-00003-of-00005.safetensors": {
+          "size": 3959604768,
+          "mtime_ns": 1790501000496305000
+        },
+        "model-00004-of-00005.safetensors": {
+          "size": 3187841392,
+          "mtime_ns": 1790500554350013700
+        },
+        "model-00005-of-00005.safetensors": {
+          "size": 1244659840,
+          "mtime_ns": 1790501040387698700
+        },
+        "model.safetensors.index.json": {
+          "size": 32878,
+          "mtime_ns": 1790500791612591400,
+          "sha256": "f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc"
+        },
+        "tokenizer.json": {
+          "size": 11422654,
+          "mtime_ns": 1790500797508743400,
+          "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+        },
+        "tokenizer_config.json": {
+          "size": 9732,
+          "mtime_ns": 1790500797820750300,
+          "sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
+        },
+        "vocab.json": {
+          "size": 2776833,
+          "mtime_ns": 1790500819824925400,
+          "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+        }
+      },
+      "note": "weight shard metadata, not full weight-payload cryptographic hashes"
+    },
+    "draft": {
+      "path": "/root/autodl-tmp/models/jetspec-qwen3-8b-020a198caefde24a2891ad827cba7fb977ccdc36",
+      "files": {
+        "config.json": {
+          "size": 1124,
+          "mtime_ns": 1790498097327240000,
+          "sha256": "e4c5f9da812f74e3a082672d93c124c5d1af0c68830be439dad9a18ccc991ee8"
+        },
+        "model.safetensors": {
+          "size": 2097259104,
+          "mtime_ns": 1790508994283198700
+        }
+      },
+      "note": "weight shard metadata, not full weight-payload cryptographic hashes"
+    }
+  },
+  "environment": {
+    "torch": "2.8.0+cu128",
+    "cuda": "12.8",
+    "gpu": "NVIDIA GeForce RTX 5090"
+  },
+  "diagnostic_helper": {
+    "path": "/root/autodl-tmp/chunked-final-mDRwZq/benchmarks/jetspec_chunked_numeric_diagnostic.py",
+    "sha256": "1a4cf8428165d5e189fd6c561178f2034c6364b8f2b6464c0081dea326c4e433"
+  },
+  "trace_helper": {
+    "path": "/root/autodl-tmp/chunked-final-mDRwZq/benchmarks/jetspec_layer_trace.py",
+    "sha256": "8386cbf150907d0f303b26201acee3c1a8cf1b51b02a812f837202bd31b8939b"
+  },
+  "stress_gate": {
+    "exit_code": 1,
+    "passed": false,
+    "error": "AssertionError: worst-plan FP32 roundoff envelope failed",
+    "declared_fp32_control": {
+      "matmul_allow_tf32": false,
+      "sdpa_backend": "MATH",
+      "roundoff_bound": 0.0002,
+      "weights": "BF16 stored weights cast one decoder at a time, original tensors restored"
+    },
+    "failed_intermediate_layers": [
+      {
+        "layer": 16,
+        "failed_metrics": {
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.783203125,
+            "scaled_max": 0.00022747075743691697,
+            "relative_rms": 0.00017909666511695845,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      },
+      {
+        "layer": 17,
+        "failed_metrics": {
+          "key": {
+            "bitwise_equal": false,
+            "max_abs": 0.00503695011138916,
+            "scaled_max": 0.0002255926220422289,
+            "relative_rms": 0.00003229708325134553,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.77734375,
+            "scaled_max": 0.00022702439666111293,
+            "relative_rms": 0.0001782361308658274,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      },
+      {
+        "layer": 18,
+        "failed_metrics": {
+          "key": {
+            "bitwise_equal": false,
+            "max_abs": 0.007493019104003906,
+            "scaled_max": 0.0003655846255123629,
+            "relative_rms": 0.00003347560256432084,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.77734375,
+            "scaled_max": 0.00022700522479184403,
+            "relative_rms": 0.00017809471231780078,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      },
+      {
+        "layer": 19,
+        "failed_metrics": {
+          "value": {
+            "bitwise_equal": false,
+            "max_abs": 0.0015609264373779297,
+            "scaled_max": 0.0002371959819210795,
+            "relative_rms": 0.00004097030114780046,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.77734375,
+            "scaled_max": 0.00022702744126343484,
+            "relative_rms": 0.00017783005077208445,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      },
+      {
+        "layer": 20,
+        "failed_metrics": {
+          "value": {
+            "bitwise_equal": false,
+            "max_abs": 0.002317190170288086,
+            "scaled_max": 0.00040109604580955123,
+            "relative_rms": 0.00004448750009573947,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.77734375,
+            "scaled_max": 0.0002270661764570858,
+            "relative_rms": 0.0001776222466282103,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      },
+      {
+        "layer": 21,
+        "failed_metrics": {
+          "key": {
+            "bitwise_equal": false,
+            "max_abs": 0.006132721900939941,
+            "scaled_max": 0.00028341209631584216,
+            "relative_rms": 0.00003107342469303877,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "value": {
+            "bitwise_equal": false,
+            "max_abs": 0.0019891858100891113,
+            "scaled_max": 0.0003759539946674982,
+            "relative_rms": 0.000052149375538692244,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.77734375,
+            "scaled_max": 0.00022706545129697566,
+            "relative_rms": 0.0001773739844127904,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      },
+      {
+        "layer": 22,
+        "failed_metrics": {
+          "key": {
+            "bitwise_equal": false,
+            "max_abs": 0.006145477294921875,
+            "scaled_max": 0.00023682906608567348,
+            "relative_rms": 0.0000280470550585067,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "value": {
+            "bitwise_equal": false,
+            "max_abs": 0.0026851296424865723,
+            "scaled_max": 0.00037046041464067057,
+            "relative_rms": 0.00005436270458325009,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.77734375,
+            "scaled_max": 0.0002270932101046577,
+            "relative_rms": 0.00017690757943352906,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      },
+      {
+        "layer": 23,
+        "failed_metrics": {
+          "key": {
+            "bitwise_equal": false,
+            "max_abs": 0.004556238651275635,
+            "scaled_max": 0.00020930878054071977,
+            "relative_rms": 0.00002671024246846258,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "value": {
+            "bitwise_equal": false,
+            "max_abs": 0.0037140846252441406,
+            "scaled_max": 0.0005498263448068376,
+            "relative_rms": 0.00005388275319013261,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.7763671875,
+            "scaled_max": 0.00022705186845399001,
+            "relative_rms": 0.0001759220459768628,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      },
+      {
+        "layer": 24,
+        "failed_metrics": {
+          "value": {
+            "bitwise_equal": false,
+            "max_abs": 0.0035338401794433594,
+            "scaled_max": 0.0004350117865830179,
+            "relative_rms": 0.000042910970961980496,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.7763671875,
+            "scaled_max": 0.00022704136984448185,
+            "relative_rms": 0.00017428964525671782,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      },
+      {
+        "layer": 25,
+        "failed_metrics": {
+          "value": {
+            "bitwise_equal": false,
+            "max_abs": 0.002317190170288086,
+            "scaled_max": 0.0002218542734944794,
+            "relative_rms": 0.00004570607635281983,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.7763671875,
+            "scaled_max": 0.00022703306593262236,
+            "relative_rms": 0.00017280879528035295,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      },
+      {
+        "layer": 26,
+        "failed_metrics": {
+          "value": {
+            "bitwise_equal": false,
+            "max_abs": 0.0022681504487991333,
+            "scaled_max": 0.00024282867247605333,
+            "relative_rms": 0.00004724439079505587,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.7763671875,
+            "scaled_max": 0.0002270220795941168,
+            "relative_rms": 0.00017091794739966033,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      },
+      {
+        "layer": 27,
+        "failed_metrics": {
+          "key": {
+            "bitwise_equal": false,
+            "max_abs": 0.004109799861907959,
+            "scaled_max": 0.00023140160797319645,
+            "relative_rms": 0.000027862266000204392,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "value": {
+            "bitwise_equal": false,
+            "max_abs": 0.0027463436126708984,
+            "scaled_max": 0.00021185330945068436,
+            "relative_rms": 0.00004661987182392441,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.7763671875,
+            "scaled_max": 0.0002269971557887149,
+            "relative_rms": 0.00016919327777388497,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      },
+      {
+        "layer": 28,
+        "failed_metrics": {
+          "value": {
+            "bitwise_equal": false,
+            "max_abs": 0.003433704376220703,
+            "scaled_max": 0.0002900858478470925,
+            "relative_rms": 0.0000469602034760149,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.7763671875,
+            "scaled_max": 0.00022694953482130698,
+            "relative_rms": 0.00016606275130752278,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      },
+      {
+        "layer": 29,
+        "failed_metrics": {
+          "value": {
+            "bitwise_equal": false,
+            "max_abs": 0.005398273468017578,
+            "scaled_max": 0.00028131298543325033,
+            "relative_rms": 0.00004028764129884858,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.7763671875,
+            "scaled_max": 0.0002269477775043264,
+            "relative_rms": 0.00016244776880569898,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      },
+      {
+        "layer": 30,
+        "failed_metrics": {
+          "value": {
+            "bitwise_equal": false,
+            "max_abs": 0.0067059993743896484,
+            "scaled_max": 0.00033602574453948307,
+            "relative_rms": 0.00004778818583254732,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.7763671875,
+            "scaled_max": 0.000226950331963755,
+            "relative_rms": 0.00015639697510078042,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      },
+      {
+        "layer": 31,
+        "failed_metrics": {
+          "key": {
+            "bitwise_equal": false,
+            "max_abs": 0.0036613941192626953,
+            "scaled_max": 0.00020713141721643647,
+            "relative_rms": 0.000029523321209927863,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "value": {
+            "bitwise_equal": false,
+            "max_abs": 0.007005214691162109,
+            "scaled_max": 0.0002769490608276733,
+            "relative_rms": 0.00004644531622821047,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.775390625,
+            "scaled_max": 0.00022694373073134334,
+            "relative_rms": 0.00015004358398749152,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      },
+      {
+        "layer": 32,
+        "failed_metrics": {
+          "value": {
+            "bitwise_equal": false,
+            "max_abs": 0.006854057312011719,
+            "scaled_max": 0.00023091914494820755,
+            "relative_rms": 0.00004261955323074449,
+            "bound": 0.0002,
+            "passed": false
+          },
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.7744140625,
+            "scaled_max": 0.00022691622605967922,
+            "relative_rms": 0.00014320613108166166,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      },
+      {
+        "layer": 33,
+        "failed_metrics": {
+          "output_hidden": {
+            "bitwise_equal": false,
+            "max_abs": 2.7783203125,
+            "scaled_max": 0.0002279840345465129,
+            "relative_rms": 0.00013224833902512778,
+            "bound": 0.0002,
+            "passed": false
+          }
+        }
+      }
+    ],
+    "final_hidden": {
+      "bitwise_equal": false,
+      "max_abs": 0.012316703796386719,
+      "scaled_max": 0.00009842603096675747,
+      "relative_rms": 0.00003120504039107482,
+      "bound": 0.0002,
+      "passed": true
+    },
+    "taps": {
+      "bitwise_equal": false,
+      "max_abs": 2.7783203125,
+      "scaled_max": 0.00022710422239833553,
+      "relative_rms": 0.00014584797976810462,
+      "bound": 0.0002,
+      "passed": false
+    },
+    "target_logits": {
+      "bitwise_equal": false,
+      "max_abs": 0.0006055831909179688,
+      "scaled_max": 0.000012311396196084906,
+      "relative_rms": 0.00001256414279185819,
+      "bound": 0.0002,
+      "passed": true
+    },
+    "target_argmax": {
+      "rows": 1,
+      "flips": 0,
+      "witnesses": [],
+      "note": "necessary near-tie inequality, not a correctness proof"
+    }
+  },
+  "replay": {
+    "completed": true,
+    "source_unchanged": true,
+    "incoming_hidden": {
+      "bitwise_equal": false,
+      "max_abs": 0.0107421875,
+      "scaled_max": 9.097502148457837e-7,
+      "relative_rms": 0.0000011564664051401455,
+      "bound": 0.0002,
+      "passed": true
+    },
+    "cumulative_own_inputs": {
+      "bitwise_equal": false,
+      "max_abs": 2.783203125,
+      "scaled_max": 0.00022747075743691697,
+      "relative_rms": 0.00017909666511695845,
+      "bound": 0.0002,
+      "passed": false
+    },
+    "same_incoming_full_input_different_shapes": {
+      "bitwise_equal": false,
+      "max_abs": 0.0087890625,
+      "scaled_max": 7.183287076955273e-7,
+      "relative_rms": 5.648459383230159e-7,
+      "bound": 0.0002,
+      "passed": true
+    },
+    "inherited_input_difference_same_full_shape": {
+      "bitwise_equal": false,
+      "max_abs": 2.79296875,
+      "scaled_max": 0.00022826890044546757,
+      "relative_rms": 0.00017972254602337612,
+      "bound": 0.0002,
+      "passed": false
+    },
+    "largest_row_errors": [
+      {
+        "row": 183,
+        "max_abs": 2.783203125,
+        "reference_max_abs": 9280.912109375
+      },
+      {
+        "row": 80,
+        "max_abs": 0.01824212074279785,
+        "reference_max_abs": 42.55985641479492
+      },
+      {
+        "row": 0,
+        "max_abs": 0.01171875,
+        "reference_max_abs": 12235.4326171875
+      },
+      {
+        "row": 207,
+        "max_abs": 0.00136566162109375,
+        "reference_max_abs": 50.12677764892578
+      },
+      {
+        "row": 255,
+        "max_abs": 0.0005941390991210938,
+        "reference_max_abs": 45.56197738647461
+      }
+    ]
+  },
+  "interpretation": [
+    "Do not label the additional fixed 2e-4 intermediate-layer envelope as passed or silently enlarge it.",
+    "All five chunk plans still exactly match the independent same-shape chronological dense reference in the main qualification.",
+    "At layer 16, reusing identical incoming hidden across full/chunk shapes yields tiny differences; inherited incoming roundoff with an unchanged full execution shape reproduces the large amplification.",
+    "The MLP-sensitive region amplifies accumulated roundoff. Final FP32 logit relative RMS is about 1.26e-5 versus BF16 0.2426; intermediate values do not obey a universal length-independent empirical threshold.",
+    "This is numeric characterization, not a broad model-quality evaluation or a guarantee of cross-shape token equivalence."
+  ],
+  "reproduction_code": {
+    "stress": "program = 'import sys, json, hashlib\\nfrom pathlib import Path\\nsys.path.insert(0, \"/root/autodl-tmp/chunked-final-mDRwZq\")\\nsys.path.insert(1, \"/root/autodl-tmp/chunked-final-mDRwZq/benchmarks\")\\nimport torch, nanovllm, jetspec\\nimport jetspec_chunked_numeric_diagnostic as diagnostic\\nimport jetspec_layer_trace as trace\\nfrom jetspec_chunked_prefill import identity, checkpoint, prompt, require, save\\ntorch.manual_seed(0)\\ntorch.backends.cuda.matmul.allow_tf32 = False\\ntorch.backends.cudnn.allow_tf32 = False\\ntarget = \"/root/autodl-tmp/models/modelscope-Qwen3-8B\"\\ndraft = \"/root/autodl-tmp/models/jetspec-qwen3-8b-020a198caefde24a2891ad827cba7fb977ccdc36\"\\noutput = \"/root/autodl-tmp/benchmarks/chunked-prefill-worst-plan-fp32.json\"\\nplan = [7,63,1,129,73]\\nreport = {\"kind\":\"extra worst observed BF16 plan FP32 causal control\", \"plan\":plan,\\n \"source\":identity(nanovllm,jetspec),\\n \"diagnostic_helper\":{\"path\":diagnostic.__file__,\"sha256\":hashlib.sha256(Path(diagnostic.__file__).read_bytes()).hexdigest()},\\n \"trace_helper\":{\"path\":trace.__file__,\"sha256\":hashlib.sha256(Path(trace.__file__).read_bytes()).hexdigest()},\\n \"models\":{\"target\":checkpoint(target),\"draft\":checkpoint(draft)},\\n \"environment\":{\"torch\":torch.__version__,\"cuda\":torch.version.cuda,\"gpu\":torch.cuda.get_device_name()},\\n \"config\":{\"tensor_parallel_size\":1,\"enforce_eager\":True,\"gpu_memory_utilization\":.7,\"max_num_batched_tokens\":4096,\"max_model_len\":4096,\"max_num_seqs\":2,\"kvcache_block_size\":256},\\n \"fp32_control\":{\"matmul_allow_tf32\":False,\"sdpa_backend\":\"MATH\",\"roundoff_bound\":2e-4,\"weights\":\"BF16 stored weights cast one decoder at a time, original tensors restored\"},\\n \"interpretation\":\"The corresponding BF16 Target logit relative RMS .242633 is a substantial cross-shape discrepancy, not tiny drift; this control tests causal algebra/shape in FP32 independently.\"}\\nreport[\"repro_code\"] = \"program = \" + repr(program) + \"\\\\nexec(program)\\\\n\"\\nengine=None\\ntry:\\n engine=nanovllm.LLM(target,**report[\"config\"])\\n engine.configure_jetspec(draft,optimization=\"serving\",enable_chunked_prefill=True,prefill_chunk_size=256,max_prefill_tokens=256)\\n runtime=engine._jetspec_scheduler.runtime\\n report[\"pool\"]={\"shape\":list(runtime.kv_pool.shape),\"dtype\":str(runtime.kv_pool.dtype)}\\n pointers=[(p,p.data_ptr(),p.dtype) for p in runtime.target.parameters()]\\n ids=torch.tensor(prompt(runtime.tokenizer,sum(plan)),dtype=torch.long,device=runtime.kv_pool.device)\\n with torch.inference_mode():\\n  control,payload=diagnostic.layer_major(runtime.target,ids,plan,runtime.target_layer_ids,fp32=True)\\n  report[\"fp32_layer_major\"]=control\\n  require(all(m[\"passed\"] for layer in control[\"layers\"] for m in (layer[\"key\"],layer[\"value\"],layer[\"output_hidden\"])) and all(control[k][\"passed\"] for k in (\"final_hidden\",\"taps\",\"target_logits\")),\"worst-plan FP32 roundoff envelope failed\")\\n  report[\"max_kv_scaled_max\"]=max(max(x[\"key\"][\"scaled_max\"],x[\"value\"][\"scaled_max\"]) for x in control[\"layers\"])\\n  report[\"max_kv_relative_rms\"]=max(max(x[\"key\"][\"relative_rms\"],x[\"value\"][\"relative_rms\"]) for x in control[\"layers\"])\\n  del payload\\n report[\"parameter_backing_restored\"]=all(p.data_ptr()==ptr and p.dtype==dtype for p,ptr,dtype in pointers)\\n require(report[\"parameter_backing_restored\"],\"FP32 casting lost original parameter backing\")\\n engine.disable_jetspec()\\n report[\"allocator_clean\"]=not engine.scheduler.block_manager.used_block_ids\\n report[\"source_unchanged\"]=report[\"source\"]==identity(nanovllm,jetspec)\\n require(report[\"allocator_clean\"] and report[\"source_unchanged\"],\"cleanup/source gate failed\")\\n report[\"passed\"]=True\\n print(json.dumps({\"passed\":True,\"plan\":plan,\"final_hidden\":control[\"final_hidden\"],\"target_logits\":control[\"target_logits\"],\"target_argmax\":control[\"target_argmax\"],\"max_kv_scaled_max\":report[\"max_kv_scaled_max\"],\"max_kv_relative_rms\":report[\"max_kv_relative_rms\"]}),flush=True)\\nexcept BaseException as error:\\n report[\"error\"]=f\"{type(error).__name__}: {error}\"\\n raise\\nfinally:\\n if engine is not None:\\n  engine.exit()\\n save(output,report)\\n'\nexec(program)\n",
+    "bounded_replay": "program = 'import sys,json,hashlib\\nfrom pathlib import Path\\nfrom collections import OrderedDict\\nsys.path.insert(0,\"/root/autodl-tmp/chunked-final-mDRwZq\")\\nsys.path.insert(1,\"/root/autodl-tmp/chunked-final-mDRwZq/benchmarks\")\\nimport torch,nanovllm,jetspec\\nfrom torch.nn.attention import SDPBackend,sdpa_kernel\\nfrom jetspec_chunked_numeric_diagnostic import fp32_parameters,independent_mask,compare_stage_records\\nfrom jetspec_chunked_prefill import identity,prompt,tensor_metrics,save\\nfrom jetspec_layer_trace import LayerTrace\\ntorch.manual_seed(0)\\ntorch.backends.cuda.matmul.allow_tf32=False\\ntorch.backends.cudnn.allow_tf32=False\\nplan=[7,63,1,129,73]\\nreport={\"kind\":\"bounded FP32 layer16 same-input replay of worst-plan stress\",\"source\":identity(nanovllm,jetspec),\"plan\":plan,\\n \"repro_code\":\"program = \"+repr(program)+\"\\\\nexec(program)\\\\n\",\\n \"note\":\"Preserves the earlier negative 2e-4 intermediate-layer stress gate; not a replacement qualification.\"}\\nengine=None\\ntry:\\n engine=nanovllm.LLM(\"/root/autodl-tmp/models/modelscope-Qwen3-8B\",tensor_parallel_size=1,enforce_eager=True,gpu_memory_utilization=.7,max_num_batched_tokens=4096,max_model_len=4096,max_num_seqs=2,kvcache_block_size=256)\\n target=engine.model_runner.model\\n ids=torch.tensor(prompt(engine.tokenizer,sum(plan)),device=\"cuda\",dtype=torch.long)\\n positions=torch.arange(ids.numel(),device=ids.device)\\n def full(layer,x,capture=False):\\n  if capture:\\n   with LayerTrace(target,range(ids.numel())) as trace:\\n    out=layer.forward_dense(positions,x,None,None,None)[0]\\n   return out,trace.records\\n  return layer.forward_dense(positions,x,None,None,None)[0],None\\n def chunks(layer,x,capture=False):\\n  keys,values,outs=[],[],[]\\n  records=OrderedDict()\\n  cursor=0\\n  for count in plan:\\n   past=(torch.cat(keys),torch.cat(values)) if cursor else None\\n   args=(positions[cursor:cursor+count],x[cursor:cursor+count],None,past,independent_mask(cursor,count,x.device))\\n   if capture:\\n    with LayerTrace(target,range(count)) as trace:\\n     output,_,kv,_=layer.forward_dense(*args)\\n    for stage,value in trace.records.items():\\n     records.setdefault(stage,[]).append(value)\\n   else:\\n    output,_,kv,_=layer.forward_dense(*args)\\n   keys.append(kv[0]);values.append(kv[1]);outs.append(output);cursor+=count\\n  return torch.cat(outs),OrderedDict((k,torch.cat(v)) for k,v in records.items())\\n with torch.inference_mode(),sdpa_kernel(SDPBackend.MATH):\\n  xf=target.model.embed_tokens(ids).float()\\n  xc=xf.clone()\\n  for index,layer in enumerate(target.model.layers[:16]):\\n   with fp32_parameters(layer):\\n    xf,_=full(layer,xf)\\n    xc,_=chunks(layer,xc)\\n  report[\"incoming_hidden\"]=tensor_metrics(xc,xf,2e-4)\\n  layer=target.model.layers[16]\\n  with fp32_parameters(layer):\\n   ff,tf=full(layer,xf,True)\\n   cc,tc=chunks(layer,xc,True)\\n   cf,tshared=chunks(layer,xf,True)\\n   fc,_=full(layer,xc)\\n   report[\"cumulative_own_inputs\"]=tensor_metrics(cc,ff,2e-4)\\n   report[\"same_incoming_full_input_different_shapes\"]=tensor_metrics(cf,ff,2e-4)\\n   report[\"inherited_input_difference_same_full_shape\"]=tensor_metrics(fc,ff,2e-4)\\n   report[\"own_inputs_trace\"]=compare_stage_records(tf,tc)\\n   report[\"same_input_trace\"]=compare_stage_records(tf,tshared)\\n   delta=(cc-ff).detach().cpu().abs()\\n   per_row=delta.amax(-1)\\n   rows=per_row.topk(5).indices.tolist()\\n   report[\"largest_row_errors\"]=[{\"row\":row,\"max_abs\":float(per_row[row]),\"reference_max_abs\":float(ff[row].abs().max())} for row in rows]\\n report[\"source_unchanged\"]=report[\"source\"]==identity(nanovllm,jetspec)\\n report[\"completed\"]=True\\n print(json.dumps({k:report[k] for k in (\"incoming_hidden\",\"cumulative_own_inputs\",\"same_incoming_full_input_different_shapes\",\"inherited_input_difference_same_full_shape\",\"largest_row_errors\")}),flush=True)\\nfinally:\\n if engine is not None:engine.exit()\\n save(\"/root/autodl-tmp/benchmarks/chunked-prefill-worst-plan-replay.json\",report)\\n'\nexec(program)\n"
+  },
+  "raw_artifacts": {
+    "chunked-prefill-worst-plan-fp32.json": {
+      "path": "/root/autodl-tmp/benchmarks/chunked-prefill-worst-plan-fp32.json",
+      "sha256": "f9a1a0ae88f0b318ab556ca0d9fb0834d1668499f6328d4bd5ff167eaf56d8bd"
+    },
+    "chunked-prefill-worst-plan-replay.json": {
+      "path": "/root/autodl-tmp/benchmarks/chunked-prefill-worst-plan-replay.json",
+      "sha256": "71ded0f9d6d11e95ed51463869ce41c1af776ad258637f7a2972bdb7919c645c"
+    }
+  }
+}

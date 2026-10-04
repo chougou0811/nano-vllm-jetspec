@@ -526,6 +526,50 @@ class Qwen3Model(nn.Module):
         target_hidden = torch.cat(tapped, dim=-1) if tapped else None
         return hidden_states, target_hidden
 
+    def forward_dense_chunk(
+        self, input_ids: torch.Tensor, positions: torch.Tensor,
+        kv_pool: torch.Tensor, prefix_slots: torch.Tensor, new_slots: torch.Tensor,
+        target_layer_ids: list[int] | tuple[int, ...] = (),
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Incremental correctness-first prefill using private canonical pages.
+
+        Q contains only this chunk. At each layer, gather only that layer's
+        historical KV, attend with the logical offset causal mask, and scatter
+        new KV directly into its already reserved destination slots. No dense
+        all-layer historical cache is materialized or retained between chunks.
+        """
+        from nanovllm.speculative.jetspec.prefill import offset_causal_mask
+        if (input_ids.ndim != 1 or positions.shape != input_ids.shape or
+                new_slots.numel() != input_ids.numel() or kv_pool.ndim != 6 or
+                kv_pool.shape[0] != 2 or kv_pool.shape[1] != len(self.layers)):
+            raise ValueError("invalid paged incremental prefill geometry")
+        block_size = int(kv_pool.shape[3])
+        prefix_pages, prefix_offsets = prefix_slots // block_size, prefix_slots % block_size
+        new_pages, new_offsets = new_slots // block_size, new_slots % block_size
+        mask = offset_causal_mask(int(prefix_slots.numel()), int(input_ids.numel()), input_ids.device)
+        hidden_states = self.embed_tokens(input_ids)
+        residual = None
+        tapped = []
+        tap_set = set(int(i) for i in target_layer_ids)
+        for layer_id, layer in enumerate(self.layers):
+            past = (kv_pool[0, layer_id, prefix_pages, prefix_offsets],
+                    kv_pool[1, layer_id, prefix_pages, prefix_offsets]) if prefix_slots.numel() else None
+            hidden_states, residual, new_kv, post_hidden = layer.forward_dense(
+                positions, hidden_states, residual, past, mask)
+            keys, values = new_kv
+            if (tuple(keys.shape) != (input_ids.numel(), *kv_pool.shape[4:]) or
+                    tuple(values.shape) != tuple(keys.shape)):
+                raise ValueError("incremental layer KV geometry differs from pool")
+            kv_pool[0, layer_id, new_pages, new_offsets] = keys
+            kv_pool[1, layer_id, new_pages, new_offsets] = values
+            if layer_id in tap_set:
+                tapped.append(post_hidden)
+            # Drop this layer's gathered historical cache before the next gather.
+            del past, new_kv, keys, values
+        hidden_states = _reference_rms_norm(hidden_states, self.norm)
+        target_hidden = torch.cat(tapped, dim=-1) if tapped else None
+        return hidden_states, target_hidden
+
     def forward_packed_tree(
         self,
         input_ids: torch.Tensor,

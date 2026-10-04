@@ -99,6 +99,9 @@ class ContinuousRuntimeFixture(unittest.TestCase):
 
     def scheduler(self, **kwargs):
         from nanovllm.engine.jetspec_scheduler import JetSpecScheduler
+        # Preserve the frozen nonchunked scheduler's ordering/failure gates.
+        # Chunked scheduling has separate lifecycle/budget coverage.
+        kwargs.setdefault("enable_chunked_prefill", False)
         self.serving = JetSpecScheduler(self.runtime, **kwargs)
         return self.serving
 
@@ -888,7 +891,10 @@ class JetSpecBlockingGenerateTest(ContinuousRuntimeFixture):
             ):
                 with self.assertRaisesRegex(RuntimeError, "blocked"):
                     engine.generate([[3]], SamplingParams(temperature=0, max_tokens=4), use_tqdm=False)
-                self.assertEqual(step.call_count, 1)
+                # Chunked admission can use the sole free page to complete
+                # this prompt and deliver its anchor. The next step reports
+                # that the foreign leases prevent allocating tree scratch.
+                self.assertEqual(step.call_count, 2)
             self.assertTrue(engine.last_step_info["blocked"])
             self.assertFalse(self.serving.requests)
             self.assertFalse(self.serving.pending_events)

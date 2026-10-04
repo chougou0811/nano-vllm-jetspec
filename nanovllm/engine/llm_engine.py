@@ -52,12 +52,15 @@ class LLMEngine:
                          tree_width: int = 7, max_tree_budget: int = 63,
                          default_tree_budget: int = 63, max_admissions_per_step: int = 2,
                          max_prefill_tokens: int | None = None,
+                         enable_chunked_prefill: bool = True, prefill_chunk_size: int = 256,
                          optimization: str = "serving"):
         """Select the greedy Continuous Batching adapter for add/step/cancel.
 
         Like nano-vLLM's ordinary engine this is a synchronous event loop, not
         an HTTP server or a concurrent GPU executor. Arrivals/cancellation are
         processed between steps; one packed Target verify executes per decode.
+        Chunked initial/recompute prefill runs between decode rounds. Its token
+        budget is separate from the packed verification query budget.
         """
         serving = getattr(self, "_jetspec_scheduler", None)
         if serving is not None:
@@ -70,7 +73,7 @@ class LLMEngine:
             raise ValueError("JetSpec optimization must be 'serving' or 'debug'")
         runtime = self.get_jetspec_batch_runtime(draft_model, tree_depth=tree_depth,
             tree_width=tree_width, max_tree_budget=max_tree_budget)
-        if runtime.requests:
+        if runtime.requests or getattr(runtime, "prefills", {}):
             raise RuntimeError("cannot enter serving mode with explicit packed requests")
         optimized = optimization == "serving"
         runtime.configure_optimizations(lightweight=optimized, batched_draft=optimized,
@@ -80,7 +83,9 @@ class LLMEngine:
         self._jetspec_scheduler = JetSpecScheduler(runtime, config.max_num_seqs,
             max_verify_tokens=config.max_num_batched_tokens,
             max_admissions_per_step=max_admissions_per_step,
-            max_prefill_tokens=max_prefill_tokens)
+            max_prefill_tokens=max_prefill_tokens,
+            enable_chunked_prefill=enable_chunked_prefill,
+            prefill_chunk_size=prefill_chunk_size)
         self._jetspec_default_tree_budget = default_tree_budget
         self.last_step_info = None
         return self._jetspec_scheduler
@@ -96,7 +101,7 @@ class LLMEngine:
         cached = getattr(self, "_jetspec_batch_runtime", None)
         if cached is not None and not cached[1]._closed:
             cached[1].release_idle_scratch()
-            if not cached[1].requests:
+            if not cached[1].requests and not getattr(cached[1], "prefills", {}):
                 cached[1].configure_optimizations()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams,
@@ -112,7 +117,7 @@ class LLMEngine:
             raise ValueError("tree_budget/custom request_id require configure_jetspec")
         cached = getattr(self, "_jetspec_batch_runtime", None)
         if cached is not None:
-            if cached[1].requests:
+            if cached[1].requests or getattr(cached[1], "prefills", {}):
                 raise RuntimeError("ordinary serving cannot interleave explicit packed requests")
             if not cached[1]._closed:
                 cached[1].release_idle_scratch()
@@ -195,7 +200,7 @@ class LLMEngine:
             raise RuntimeError("generate requires an idle JetSpec serving queue; use step for live arrivals")
         batch_cached = getattr(self, "_jetspec_batch_runtime", None)
         if batch_cached is not None and serving is None:
-            if batch_cached[1].requests:
+            if batch_cached[1].requests or getattr(batch_cached[1], "prefills", {}):
                 raise RuntimeError("ordinary generation cannot interleave live JetSpec batch requests")
             if not batch_cached[1]._closed:
                 batch_cached[1].release_idle_scratch()
@@ -254,7 +259,7 @@ class LLMEngine:
                         exception.add_note(f"generate cleanup for {request_id!r} failed: {cleanup_error}")
                 try:
                     serving.drain_events()
-                    if not serving.runtime.requests:
+                    if not serving.runtime.requests and not getattr(serving.runtime, "prefills", {}):
                         serving.runtime.release_idle_scratch()
                 except BaseException as cleanup_error:
                     exception.add_note(f"generate final cleanup failed: {cleanup_error}")
@@ -299,7 +304,7 @@ class LLMEngine:
         if getattr(self, "_jetspec_scheduler", None) is not None:
             raise RuntimeError("disable Continuous Batching before using legacy JetSpec")
         batch_cached = getattr(self, "_jetspec_batch_runtime", None)
-        if batch_cached is not None and batch_cached[1].requests:
+        if batch_cached is not None and (batch_cached[1].requests or getattr(batch_cached[1], "prefills", {})):
             raise RuntimeError("legacy JetSpec cannot interleave live packed requests")
         from nanovllm.speculative.jetspec.runtime import JetSpecRuntime
 
@@ -346,7 +351,7 @@ class LLMEngine:
         key = (draft_model, int(tree_depth), int(tree_width), int(max_tree_budget))
         cached = getattr(self, "_jetspec_batch_runtime", None)
         if cached is not None and (cached[0] != key or cached[1]._closed):
-            if cached[1].requests:
+            if cached[1].requests or getattr(cached[1], "prefills", {}):
                 raise RuntimeError("cannot replace a packed runner with live requests")
             cached[1].close()
             cached = None

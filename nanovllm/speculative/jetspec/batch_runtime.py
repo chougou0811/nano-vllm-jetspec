@@ -71,6 +71,7 @@ class JetSpecBatchRuntime:
         self.tree_algorithm = get_algorithm("accum_logp")
         self.arena = TreeScratchArena(kv_pool, block_manager, block_size)
         self.requests: dict[str | int, JetSpecRequest] = {}
+        self.prefills = {}
         self._ids = count()
         self._active_transaction: BatchTreeTransaction | None = None
         self._closed = False
@@ -89,7 +90,7 @@ class JetSpecBatchRuntime:
                                 feature_storage=False):
         """Select independently measurable serving paths at an idle boundary."""
         self._check_idle()
-        if self.requests:
+        if self.requests or getattr(self, "prefills", {}):
             raise RuntimeError("optimization policy cannot change with live requests")
         self._lightweight = bool(lightweight)
         self._batched_draft_enabled = bool(batched_draft)
@@ -98,7 +99,7 @@ class JetSpecBatchRuntime:
 
     def _configure_state(self, state):
         state.validate_device = not getattr(self, "_lightweight", False)
-        if getattr(self, "_feature_storage", False):
+        if getattr(self, "_feature_storage", False) and state._feature_storage is None:
             state.enable_feature_storage(max_capacity=self.max_model_len)
 
     def _check_idle(self) -> None:
@@ -121,6 +122,144 @@ class JetSpecBatchRuntime:
         )
 
     @torch.inference_mode()
+    def begin_prefill(self, prompt=None, *, max_new_tokens=32, tree_budget=63,
+                      ignore_eos=False, request_id=None, snapshot=None):
+        """Register page-empty PREFILL/RECOMPUTE state, separate from READY.
+
+        Resume rebuilds all historical rows except the saved uncached anchor;
+        it never predicts or emits another anchor. Call prefill_step repeatedly
+        with a bounded query budget, then use the returned READY request.
+        """
+        from nanovllm.speculative.jetspec.prefill import PrefillContext
+        self._check_idle()
+        if not hasattr(self, "prefills"):
+            self.prefills = {}
+        saved = None
+        created_at = time.perf_counter()
+        if snapshot is not None:
+            if prompt is not None or (request_id is not None and request_id != snapshot["request_id"]):
+                raise ValueError("resume accepts a snapshot, not a replacement prompt/request ID")
+            saved = dict(snapshot)
+            saved["committed_tokens"] = list(snapshot["committed_tokens"])
+            saved["output_ids"] = list(snapshot["output_ids"])
+            saved["rounds"] = list(snapshot["rounds"])
+            request_id, tree_budget = saved["request_id"], saved["tree_budget"]
+            max_new_tokens, ignore_eos = saved["max_new_tokens"], saved["ignore_eos"]
+            created_at = saved["created_at"]
+            if (len(saved["committed_tokens"]) < 2 or not saved["output_ids"] or
+                    len(saved["output_ids"]) >= max_new_tokens or
+                    saved["prompt_length"] < 1 or
+                    len(saved["committed_tokens"]) != saved["prompt_length"] + len(saved["output_ids"]) or
+                    saved["committed_tokens"][-len(saved["output_ids"]):] != saved["output_ids"]):
+                raise ValueError("invalid suspended request tokens/output anchor")
+            ids = self._prompt_ids(saved["committed_tokens"][:-1])
+            prompt_length = saved["prompt_length"]
+        else:
+            ids = self._prompt_ids(prompt)
+            prompt_length = int(ids.shape[1])
+        if max_new_tokens < 1 or not 1 <= tree_budget <= self.max_tree_budget:
+            raise ValueError("invalid output limit or request tree budget")
+        # Match original admission's conservative lookahead bound. Recompute
+        # tokens exclude its saved anchor; do not accidentally gain one token
+        # of model-length allowance by validating only prefix+remaining.
+        if prompt_length + max_new_tokens + self.tree_depth > self.max_model_len:
+            raise ValueError("prompt/output/tree lookahead exceed the configured model length")
+        if request_id is None:
+            request_id = next(self._ids)
+            while request_id in self.requests or request_id in self.prefills:
+                request_id = next(self._ids)
+        if request_id in self.requests or request_id in self.prefills:
+            raise ValueError("request ID is already live")
+        context = PrefillContext(request_id, ids, self.kv_pool, self.block_manager,
+            self.block_size, int(tree_budget), int(max_new_tokens), bool(ignore_eos),
+            prompt_length, created_at, snapshot=saved)
+        # Token construction can occur on a different stream from chunk one.
+        context.record_ready()
+        self.prefills[request_id] = context
+        return context
+
+    def _prefill_owned(self, context):
+        self._check_idle()
+        if getattr(self, "prefills", {}).get(context.request_id) is not context:
+            raise ValueError("prefill context does not belong to this runner")
+
+    def estimate_prefill_chunk_capacity(self, context, num_tokens):
+        self._prefill_owned(context)
+        return context.capacity(num_tokens)
+
+    @torch.inference_mode()
+    def prefill_step(self, context, num_tokens):
+        """Append one chunk; publish exactly once only when the prefix is ready."""
+        from nanovllm.speculative.jetspec.prefill import forward_chunk
+        self._prefill_owned(context)
+        count = context.chunk_length(num_tokens)
+        if not context.capacity(count)["feasible"]:
+            # Expected allocator backpressure has not queued any writes and
+            # preserves the existing partial prefix for a later retry.
+            raise RuntimeError("insufficient KV blocks for prefill chunk")
+        try:
+            reset_context()
+            hidden = forward_chunk(self.target, context, count, self.target_layer_ids)
+            if context.remaining_tokens:
+                return None
+            context.begin_writes()
+            if context.snapshot is None:
+                anchor = self.target.lm_head(hidden[-1:])[-1].argmax().reshape(1, 1)
+                committed = torch.cat((context.tokens, anchor), 1)
+                output_ids = [int(anchor.item())]
+                rounds, preemptions = [], 0
+            else:
+                saved = context.snapshot
+                committed = self._prompt_ids(saved["committed_tokens"])
+                output_ids = list(saved["output_ids"])
+                rounds, preemptions = list(saved["rounds"]), saved["preemptions"]
+            scratch = TreeScratchArena(self.kv_pool, self.block_manager, self.block_size)
+            scratch._retired = context._ready
+            state = PagedTargetState(committed, context.target_hidden, self.kv_pool,
+                self.block_manager, self.block_size, context.logical_slots,
+                list(context.owned_blocks), [], scratch=scratch)
+            # Keep the prefill capacity backing; decode appends without cat.
+            state._feature_storage = context.feature_storage
+            state._feature_max_capacity = self.max_model_len
+            state._feature_append_bytes = sum(r["feature_append_bytes"] for r in context.chunk_records)
+            self._configure_state(state)
+            request = JetSpecRequest(context.request_id, state, self._new_drafter(),
+                context.tree_budget, context.max_new_tokens, context.ignore_eos,
+                context.prompt_length, output_ids, context.created_at,
+                finished=(len(output_ids) >= context.max_new_tokens or
+                    (not context.ignore_eos and output_ids[-1] in self.eos_token_ids)),
+                rounds=rounds, preemptions=preemptions)
+            state.assert_round_invariant()
+            # Promotion itself creates committed/slot metadata and may enqueue
+            # feature operations. Fence ALL of it, not just the last chunk/head.
+            # Keep _writing_stream live until here so exceptions also fence any
+            # promotion work not covered by the previous chunk's ready event.
+            context.record_ready()
+            scratch._retired = context._ready
+            self.requests[request.request_id] = request
+            del self.prefills[context.request_id]
+            context.owned_blocks = []
+            context.feature_storage = None
+            context.promoted = True
+            return request
+        except BaseException as exception:
+            context.error = f"{type(exception).__name__}: {exception}"
+            try:
+                self.cancel_prefill(context)
+            except BaseException as cleanup:
+                exception.add_note(f"partial prefill cleanup failed: {cleanup}")
+            raise
+
+    def cancel_prefill(self, context):
+        self._check_idle()
+        if context.promoted or context.cancelled:
+            return 0
+        self._prefill_owned(context)
+        released = context.clear()
+        del self.prefills[context.request_id]
+        return released
+
+    @torch.inference_mode()
     def create_request(self, prompt, *, max_new_tokens: int = 32, tree_budget: int = 63,
                        ignore_eos: bool = False, request_id: str | int | None = None) -> JetSpecRequest:
         self._check_idle()
@@ -128,9 +267,9 @@ class JetSpecBatchRuntime:
             raise ValueError("invalid output limit or request tree budget")
         if request_id is None:
             request_id = next(self._ids)
-            while request_id in self.requests:
+            while request_id in self.requests or request_id in getattr(self, "prefills", {}):
                 request_id = next(self._ids)
-        if request_id in self.requests:
+        if request_id in self.requests or request_id in getattr(self, "prefills", {}):
             raise ValueError("request ID is already live")
         created_at = time.perf_counter()
         ids = self._prompt_ids(prompt)
@@ -171,21 +310,27 @@ class JetSpecBatchRuntime:
 
     def capacity_snapshot(self) -> dict[str, int | float]:
         states = [r.state for r in self.requests.values()]
+        partials = list(getattr(self, "prefills", {}).values())
         committed = sum(len(s.owned_blocks) for s in states)
+        partial_blocks = sum(len(c.owned_blocks) for c in partials)
         pending = sum(len(s.pending_blocks) for s in states)
         scratch = len(self.arena.blocks)
-        live = sum(s.cache_len for s in states)
-        reserved = (committed + pending + scratch) * self.block_size
+        live = sum(s.cache_len for s in states) + sum(c.processed_tokens for c in partials)
+        reserved = (committed + partial_blocks + pending + scratch) * self.block_size
         features = [s.feature_storage_snapshot() for s in states]
         from nanovllm.speculative.jetspec.batched_draft import BatchedDraftProposer
         return {"requests": len(states), "committed_blocks": committed,
+                "prefill_requests": len(partials), "prefill_blocks": partial_blocks,
+                "prefill_processed_tokens": sum(c.processed_tokens for c in partials),
                 "pending_destination_blocks": pending, "scratch_blocks": scratch,
                 "scratch_capacity_slots": self.arena.capacity,
                 "live_kv_slots": live, "reserved_kv_slots": reserved,
                 "allocator_used_blocks": len(self.block_manager.used_block_ids),
                 "amplification": reserved / live if live else None,
-                "target_feature_reserved_bytes": sum(s["feature_reserved_bytes"] for s in features),
-                "target_feature_live_bytes": sum(s.target_hidden.numel() * s.target_hidden.element_size() for s in states),
+                "target_feature_reserved_bytes": sum(s["feature_reserved_bytes"] for s in features) + sum(
+                    c.feature_storage.numel() * c.feature_storage.element_size() for c in partials if c.feature_storage is not None),
+                "target_feature_live_bytes": sum(s.target_hidden.numel() * s.target_hidden.element_size() for s in states) + sum(
+                    c.target_hidden.numel() * c.target_hidden.element_size() for c in partials if c.target_hidden is not None),
                 "draft_cache_bytes": BatchedDraftProposer._cache_bytes(self.requests.values()),
                 "memory_model": "admission budgets Target KV pages; auxiliary bytes are observed, not a full CUDA admission model"}
 
@@ -266,7 +411,7 @@ class JetSpecBatchRuntime:
         """Rebuild historical KV/features without replacing/emitting the anchor."""
         self._check_idle()
         request_id = snapshot["request_id"]
-        if request_id in self.requests:
+        if request_id in self.requests or request_id in getattr(self, "prefills", {}):
             raise ValueError("request ID is already live")
         ids = self._prompt_ids(snapshot["committed_tokens"])
         prefix = ids[0, :-1]
@@ -550,6 +695,8 @@ class JetSpecBatchRuntime:
 
     def release_idle_scratch(self) -> int:
         self._check_idle()
+        # Partial prefixes own canonical pages, never runner scratch. Permit
+        # releasing an oversized idle arena to relieve incremental admission.
         if self.requests:
             raise RuntimeError("cannot release runner scratch while requests are live")
         return self.arena.clear()
@@ -558,7 +705,7 @@ class JetSpecBatchRuntime:
     def generate_batch(self, prompts, *, max_new_tokens=32, tree_budgets=63,
                        ignore_eos: bool = False, return_rounds: bool = True) -> dict:
         self._check_idle()
-        if self.requests:
+        if self.requests or getattr(self, "prefills", {}):
             raise RuntimeError("generate_batch requires no existing live requests; use step for admission")
         prompts = list(prompts)
         if not prompts:
@@ -647,6 +794,8 @@ class JetSpecBatchRuntime:
         if self._active_transaction is not None:
             self._active_transaction.abort()
             self._active_transaction = None
+        for context in list(getattr(self, "prefills", {}).values()):
+            self.cancel_prefill(context)
         for r in list(self.requests.values()):
             self.cancel(r)
         self.arena.clear()

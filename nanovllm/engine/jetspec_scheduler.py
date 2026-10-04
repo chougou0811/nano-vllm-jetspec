@@ -25,6 +25,7 @@ class JetSpecTicket:
     arrival_order: int
     status: str = "waiting"
     request: Any = None
+    prefill: Any = None
     snapshot: dict | None = None
     output_ids: list[int] = field(default_factory=list)
     emitted_cursor: int = 0
@@ -42,28 +43,36 @@ class JetSpecScheduler:
     """
 
     def __init__(self, runtime, max_num_seqs: int, max_verify_tokens: int | None = None,
-                 max_admissions_per_step: int = 2, max_prefill_tokens: int | None = None):
+                 max_admissions_per_step: int = 2, max_prefill_tokens: int | None = None,
+                 enable_chunked_prefill: bool = True, prefill_chunk_size: int = 256):
         if max_verify_tokens is None:
             max_verify_tokens = runtime.max_verify_tokens
         if max_prefill_tokens is None:
-            max_prefill_tokens = runtime.max_model_len
+            max_prefill_tokens = (min(512, runtime.max_verify_tokens)
+                                  if enable_chunked_prefill else runtime.max_model_len)
+        if not isinstance(enable_chunked_prefill, bool):
+            raise ValueError("enable_chunked_prefill must be a boolean")
         for name, value in (("max_num_seqs", max_num_seqs), ("max_verify_tokens", max_verify_tokens),
                             ("max_admissions_per_step", max_admissions_per_step),
-                            ("max_prefill_tokens", max_prefill_tokens)):
+                            ("max_prefill_tokens", max_prefill_tokens),
+                            ("prefill_chunk_size", prefill_chunk_size)):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
         if max_verify_tokens > runtime.max_verify_tokens:
             raise ValueError("scheduler verification budget exceeds the runner budget")
-        if runtime.requests:
+        if runtime.requests or getattr(runtime, "prefills", {}):
             raise RuntimeError("a serving scheduler requires an idle borrowed runtime")
         self.runtime = runtime
         self.max_num_seqs = max_num_seqs
         self.max_verify_tokens = max_verify_tokens
         self.max_admissions_per_step = max_admissions_per_step
         self.max_prefill_tokens = max_prefill_tokens
+        self.enable_chunked_prefill = enable_chunked_prefill
+        self.prefill_chunk_size = prefill_chunk_size
         self.requests: dict[str | int, JetSpecTicket] = {}
         self.waiting: deque[str | int] = deque()
         self.running: deque[str | int] = deque()
+        self.prefilling: deque[str | int] = deque()
         self.pending_events: deque[dict] = deque()
         self.last_step: dict | None = None
         self._ids = count()
@@ -71,6 +80,8 @@ class JetSpecScheduler:
         self._in_step = False
         self._closed = False
         self._blocked_reason = None
+        self._prefill_chunks: list[dict] = []
+        self._prefill_preempted: list[str | int] = []
 
     def _check_boundary(self):
         if self._closed:
@@ -89,7 +100,7 @@ class JetSpecScheduler:
         ids = self.runtime.tokenizer.encode(prompt) if isinstance(prompt, str) else list(prompt)
         if not ids or any(isinstance(token, bool) or not isinstance(token, int) or token < 0 for token in ids):
             raise ValueError("prompt must contain nonnegative integer token IDs")
-        if len(ids) > self.max_prefill_tokens:
+        if not self.enable_chunked_prefill and len(ids) > self.max_prefill_tokens:
             raise ValueError("prompt exceeds the nonchunked prefill token budget")
         if max_new_tokens and len(ids) + max_new_tokens + self.runtime.tree_depth > self.runtime.max_model_len:
             raise ValueError("prompt/output/tree lookahead exceed the configured model length")
@@ -119,6 +130,7 @@ class JetSpecScheduler:
         """Physical runner capacity plus host-side admission/recompute queues."""
         return {**self.runtime.capacity_snapshot(), "waiting_count": len(self.waiting),
                 "running_count": len(self.running),
+                "prefilling_count": len(self.prefilling),
                 "suspended_count": sum(ticket.snapshot is not None for ticket in self.requests.values())}
 
     def drain_events(self) -> list[dict]:
@@ -163,9 +175,11 @@ class JetSpecScheduler:
         self.pending_events.append(event)
         self._remove(self.waiting, ticket.request_id)
         self._remove(self.running, ticket.request_id)
+        self._remove(self.prefilling, ticket.request_id)
         self.requests.pop(ticket.request_id, None)
         ticket.status = kind
         ticket.request = None
+        ticket.prefill = None
         ticket.snapshot = None
         return event
 
@@ -189,6 +203,9 @@ class JetSpecScheduler:
         if ticket is None:
             return None
         try:
+            if ticket.prefill is not None:
+                self.runtime.cancel_prefill(ticket.prefill)
+                ticket.prefill = None
             result = self.runtime.cancel(ticket.request) if ticket.request is not None else None
             return self._terminal(ticket, "cancelled", "cancelled_by_caller", result)
         except BaseException as exception:
@@ -201,6 +218,10 @@ class JetSpecScheduler:
     def _fail(self, ticket, exception):
         # Find a runtime request even if create/resume failed after registering
         # it but before returning it to the adapter.
+        partial = ticket.prefill or getattr(self.runtime, "prefills", {}).get(ticket.request_id)
+        if partial is not None:
+            self.runtime.cancel_prefill(partial)
+            ticket.prefill = None
         request = ticket.request or self.runtime.requests.get(ticket.request_id)
         result = None
         if request is not None:
@@ -264,6 +285,143 @@ class JetSpecScheduler:
         # Only current-prefix + one physical committed slot + one scratch page
         # is mandatory. Do not reserve every possible future output in advance.
         return (cached_tokens + (1 if remaining_outputs else 0) + b - 1) // b + bool(remaining_outputs)
+
+    def _preempt_prefill(self, ticket):
+        """Discard partial reconstruction, never its delivered output/snapshot.
+
+        Partial requests cannot enter Draft or share tree scratch. Reclaiming a
+        younger partial first prevents several incomplete prefixes from holding
+        all pages while a resident or the oldest partial cannot make progress.
+        """
+        self.runtime.cancel_prefill(ticket.prefill)
+        ticket.prefill = None
+        ticket.preemptions += 1
+        ticket.status = "suspended" if ticket.snapshot is not None else "waiting"
+        self._remove(self.prefilling, ticket.request_id)
+        self._insert_waiting_by_arrival(ticket)
+        self._prefill_preempted.append(ticket.request_id)
+
+    def _begin_prefills(self, admitted_ids, preempted_ids):
+        attempts = 0
+        excluded = set(preempted_ids) | set(self._prefill_preempted)
+        while (self.waiting and len(self.running) + len(self.prefilling) < self.max_num_seqs
+               and attempts < self.max_admissions_per_step):
+            ticket = self.requests[self.waiting[0]]
+            # Do not immediately restart a victim of this very step, which
+            # would reoccupy the pages just released to allow decode progress.
+            if ticket.request_id in excluded:
+                break
+            # Once a partial/recompute has been evicted, stop admitting younger
+            # work until that prefix is READY. Otherwise a sustained stream of
+            # short prompts can repeatedly steal its pages: completed younger
+            # residents look like progress while the old long prompt starves.
+            # Existing residents still decode; their finite completion releases
+            # capacity without preempting them just to admit a newcomer.
+            retries = [t for t in self.requests.values()
+                       if t.preemptions and t.request is None]
+            if retries and ticket.arrival_order > min(t.arrival_order for t in retries):
+                self._blocked_reason = "prefill_retry_admission_fence"
+                break
+            length = self._prefill_length(ticket)
+            remaining = ticket.max_new_tokens - (len(ticket.output_ids) if ticket.snapshot is not None else 1)
+            attempts += 1
+            if self._minimum_total_pages(length, remaining) > len(self.runtime.block_manager.blocks):
+                self._capacity_error(ticket, "current prefix cannot fit even singleton tree_budget=1")
+                continue
+            try:
+                if ticket.snapshot is not None:
+                    partial = self.runtime.begin_prefill(snapshot=ticket.snapshot)
+                else:
+                    partial = self.runtime.begin_prefill(ticket.prompt_ids,
+                        max_new_tokens=ticket.max_new_tokens, tree_budget=ticket.tree_budget,
+                        ignore_eos=ticket.ignore_eos, request_id=ticket.request_id)
+                    admitted_ids.append(ticket.request_id)
+                ticket.prefill = partial
+                ticket.status = "prefilling"
+                self.waiting.popleft()
+                self.prefilling.append(ticket.request_id)
+            except BaseException as exception:
+                try:
+                    self._fail(ticket, exception)
+                except BaseException as cleanup_error:
+                    exception.add_note(f"partial prefill admission cleanup also failed: {cleanup_error}")
+                raise
+
+    def _prefill_can_advance(self, ticket, count):
+        while True:
+            estimate = self.runtime.estimate_prefill_chunk_capacity(ticket.prefill, count)
+            required = estimate["required_free_blocks"]
+            free = len(self.runtime.block_manager.free_block_ids)
+            if self.running:
+                # Reserve enough *free* capacity for one resident's next root
+                # verification. No separate scratch is leased for prefilling.
+                oldest = self.requests[self.running[0]].request
+                keep = self.runtime.estimate_step_capacity([oldest], [1])["required_free_blocks"]
+                if required + keep <= free:
+                    return True
+                self._blocked_reason = "prefill_preserves_resident_decode"
+                return False
+            if required <= free:
+                return True
+            if self.runtime.arena.blocks:
+                self.runtime.arena.clear()
+                continue
+            partials = [self.requests[rid] for rid in self.prefilling]
+            oldest = min(partials, key=lambda t: t.arrival_order)
+            if ticket is oldest:
+                victims = [t for t in partials if t is not ticket and t.prefill.owned_blocks]
+                if victims:
+                    self._preempt_prefill(max(victims, key=lambda t: t.arrival_order))
+                    continue
+            self._blocked_reason = "waiting_for_kv_prefill"
+            return False
+
+    def _advance_prefills(self, admitted_ids, resumed_ids, preempted_ids):
+        self._begin_prefills(admitted_ids, preempted_ids)
+        remaining = self.max_prefill_tokens
+        # One quantum per partial per step; rotate survivors so a small total
+        # budget cannot starve the second request behind the first long prompt.
+        for request_id in list(self.prefilling):
+            if not remaining:
+                break
+            ticket = self.requests.get(request_id)
+            if ticket is None or ticket.prefill is None:
+                continue
+            partial = ticket.prefill
+            start = partial.processed_tokens
+            count = min(self.prefill_chunk_size, remaining, partial.total_tokens - start)
+            if not self._prefill_can_advance(ticket, count):
+                continue
+            record = {"request_id": request_id, "start": start, "end": start + count,
+                      "total_tokens": partial.total_tokens,
+                      "is_recompute": ticket.snapshot is not None, "completed": False}
+            try:
+                request = self.runtime.prefill_step(partial, count)
+                record["completed"] = request is not None
+                self._prefill_chunks.append(record)
+                remaining -= count
+                self._remove(self.prefilling, request_id)
+                if request is None:
+                    self.prefilling.append(request_id)
+                    continue
+                ticket.prefill = None
+                ticket.request = request
+                request.preemptions = ticket.preemptions
+                if ticket.snapshot is not None:
+                    resumed_ids.append(request_id)
+                ticket.snapshot = None
+                ticket.status = "running"
+                self.running.append(request_id)
+                self._progress(ticket)  # Recompute keeps the existing cursor.
+                if request.finished:
+                    result = self.runtime.finish(request)
+                    self._terminal(ticket, "finished", "eos_or_output_limit", result)
+            except BaseException as exception:
+                try:
+                    self._fail(ticket, exception)
+                except BaseException as cleanup_error:
+                    exception.add_note(f"partial prefill progress cleanup also failed: {cleanup_error}")
+                raise
 
     def _admit(self, admitted_ids, resumed_ids):
         attempts = 0
@@ -369,6 +527,11 @@ class JetSpecScheduler:
             if self._minimum_total_pages(oldest.request.state.cache_len, remaining_outputs) > len(self.runtime.block_manager.blocks):
                 self._capacity_error(oldest, "grown prefix cannot fit even singleton tree_budget=1")
                 continue
+            partials = [self.requests[rid] for rid in self.prefilling
+                        if self.requests[rid].prefill.owned_blocks]
+            if partials:
+                self._preempt_prefill(max(partials, key=lambda t: t.arrival_order))
+                continue
             victim = next((t for t in reversed(tickets) if t is not oldest), None)
             if victim is None:
                 # A held provisional page can be returned between steps. This
@@ -379,44 +542,68 @@ class JetSpecScheduler:
         return [], []
 
     def _report(self, verification, admitted_ids, resumed_ids, preempted_ids, *, events):
-        blocked = bool(self.requests and verification is None and not admitted_ids and not resumed_ids)
+        # A page-empty partial registration is not computational progress. If
+        # external leases prevent even its first chunk, blocking generate must
+        # report backpressure immediately rather than perform a spurious step.
+        blocked = bool(self.requests and verification is None and not resumed_ids
+                       and not self._prefill_chunks
+                       and (self.enable_chunked_prefill or not admitted_ids))
         return {"events": events, "verification": verification,
                 "admitted_ids": list(admitted_ids), "resumed_ids": list(resumed_ids),
                 "preempted_ids": list(preempted_ids), "waiting_count": len(self.waiting),
                 "running_count": len(self.running), "capacity": self.capacity_snapshot(),
+                "prefilling_count": len(self.prefilling),
+                "prefill_chunks": list(self._prefill_chunks),
+                "prefill_tokens": sum(r["end"] - r["start"] for r in self._prefill_chunks),
+                "prefill_preempted_ids": list(self._prefill_preempted),
                 "blocked": blocked,
                 "blocked_reason": (self._blocked_reason or "waiting_for_kv_or_admission") if blocked else None}
+
+    def _decode_once(self, preempted_ids):
+        selected, budgets = self._select(preempted_ids)
+        if not selected:
+            return None
+        try:
+            verification = self.runtime.step([t.request for t in selected], tree_budgets=budgets)
+        except BaseException as exception:
+            # Commit may already have published all output/state. Emit that
+            # progress exactly once, then terminate only this selected batch.
+            for ticket in selected:
+                try:
+                    self._fail(ticket, exception)
+                except BaseException as cleanup_error:
+                    exception.add_note(f"request {ticket.request_id} cleanup also failed: {cleanup_error}")
+            raise
+        for ticket in selected:
+            self._progress(ticket)
+        self._finish_completed()
+        for ticket in selected:
+            if ticket.request_id in self.requests:
+                self._remove(self.running, ticket.request_id)
+                self.running.append(ticket.request_id)
+        return verification
 
     def step(self):
         self._check_boundary()
         self._in_step = True
         admitted_ids, resumed_ids, preempted_ids = [], [], []
-        selected = []
         verification = None
         self._blocked_reason = None
+        self._prefill_chunks = []
+        self._prefill_preempted = []
         try:
             self._finish_completed()
-            self._admit(admitted_ids, resumed_ids)
-            selected, budgets = self._select(preempted_ids)
-            if selected:
-                try:
-                    verification = self.runtime.step([t.request for t in selected], tree_budgets=budgets)
-                except BaseException as exception:
-                    # Commit may already have published all output/state. Emit
-                    # that progress exactly once, then terminate only this batch.
-                    for ticket in selected:
-                        try:
-                            self._fail(ticket, exception)
-                        except BaseException as cleanup_error:
-                            exception.add_note(f"request {ticket.request_id} cleanup also failed: {cleanup_error}")
-                    raise
-                for ticket in selected:
-                    self._progress(ticket)
-                self._finish_completed()
-                for ticket in selected:
-                    if ticket.request_id in self.requests:
-                        self._remove(self.running, ticket.request_id)
-                        self.running.append(ticket.request_id)
+            if self.enable_chunked_prefill:
+                # Resident decode has priority. This is interleaved execution,
+                # not a fused prefill/tree attention forward or async executor.
+                verification = self._decode_once(preempted_ids)
+                self._advance_prefills(admitted_ids, resumed_ids, preempted_ids)
+                if verification is None:
+                    verification = self._decode_once(preempted_ids)
+            else:
+                # Explicit reference switch retains Phase 4 admission/order.
+                self._admit(admitted_ids, resumed_ids)
+                verification = self._decode_once(preempted_ids)
             events = list(self.pending_events)
             report = self._report(verification, admitted_ids, resumed_ids, preempted_ids, events=events)
             self.last_step = report
@@ -433,6 +620,10 @@ class JetSpecScheduler:
                                   "admitted_ids": admitted_ids, "resumed_ids": resumed_ids,
                                   "preempted_ids": preempted_ids, "waiting_count": len(self.waiting),
                                   "running_count": len(self.running), "capacity": None,
+                                  "prefilling_count": len(self.prefilling),
+                                  "prefill_chunks": list(self._prefill_chunks),
+                                  "prefill_tokens": sum(r["end"] - r["start"] for r in self._prefill_chunks),
+                                  "prefill_preempted_ids": list(self._prefill_preempted),
                                   "blocked": False, "blocked_reason": None,
                                   "reporting_error": str(reporting_error)}
             raise
@@ -446,7 +637,7 @@ class JetSpecScheduler:
         self._check_boundary()
         for request_id in list(self.requests):
             self.cancel(request_id)
-        if not self.runtime.requests:
+        if not self.runtime.requests and not getattr(self.runtime, "prefills", {}):
             self.runtime.release_idle_scratch()
         events = self.drain_events()
         self._closed = True
