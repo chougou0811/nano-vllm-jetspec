@@ -277,6 +277,45 @@ capacity-managed decoding state without concatenating the whole history.
   or a universal cross-shape error bound. The explicit nonchunked control remains
   available.
 
+### Measured serving tradeoffs
+
+[Matched results](benchmarks/chunked_prefill_benchmark.json), RTX 5090 / BF16 /
+TP1 eager: two waves of `c` requests, initial prompt 128 and later prompts
+1024/2048 tokens, mixed tree budgets 63/31/47, output caps scaled by
+`[1, 1, 1/2, 1/4]`. One warmup and one timed sample per mode/case; these are
+descriptive measurements, not confidence intervals. The baseline is the same
+process's **nonchunked JetSpec** mode, not ordinary AR or external vLLM.
+
+Each column below sets **both** the per-request chunk and aggregate step budget
+to the column's token count. Thus 256/256 is **not** the public default
+quantum=256/global=512 configuration. Throughput is aggregate tokens/s;
+the last column is the maximum inter-delivery-**batch** gap, not per-token ITL.
+
+| Concurrency / output cap scale | Nonchunked | 64/64 | 256/256 | 512/512 | Max gap: nonchunked → 256/256 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| c1 / 128 | 146.2 | 116.4 | 142.9 | 144.2 | 44 → 70 ms |
+| c1 / 512 | 164.1 | 153.5 | 163.9 | 164.1 | 54 → 69 ms |
+| c4 / 128 | 257.3 | 109.3 | 234.4 | 251.8 | 362 → 112 ms |
+| c4 / 512 | 349.4 | 241.9 | 330.4 | 340.7 | 262 → 117 ms |
+| c8 / 128 | 303.7 | 117.1 | 231.6 | 263.3 | 403 → 137 ms |
+| c8 / 512 | 386.3 | 236.0 | 362.3 | 374.3 | 413 → 178 ms |
+
+This implementation trades long-prefill interference for additional small
+forwards/gathers; it is **not a universal throughput or TTFT optimization**.
+For c8/128, offered-clock P95 TTFT increases from 3.162 s to 4.880 s at 256/256
+and 10.779 s at 64/64. Even delivery-gap percentiles do not uniformly improve
+(c4/512 P95: 85 → 101 ms at 256/256), although its worst gap decreases.
+Choose budgets against the workload's latency requirements; very small chunks
+are especially costly with this correctness-first SDPA backend.
+
+All 24 timed samples completed with request/partial/feature/Draft state cleared;
+the reusable scratch was released on final disable and allocator cleanup passed.
+The same 249-page Target pool was retained across all modes. For c8/512,
+peak leased slots decrease from 13,568 to 12,288 at 256/256, but peak CUDA
+allocated memory is essentially unchanged (29.556 vs 29.555 GB). Fewer leased
+pages are not the same as shrinking the already allocated pool or solving the
+full auxiliary-memory admission problem.
+
 ## Upstream ordinary-AR example and historical benchmark
 
 The upstream `example.py` and `bench.py` illustrate ordinary nano-vLLM (edit their
