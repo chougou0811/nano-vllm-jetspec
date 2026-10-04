@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -17,6 +18,39 @@ from types import SimpleNamespace
 from jetspec_phase3 import save_json
 from jetspec_phase31 import identity
 import jetspec_phase32 as shared
+
+
+def qualification_identity(args):
+    """Pin the selected production tree and the actually loaded diagnostic code.
+
+    --repo can select a clean checkout while this script/helpers live outside
+    it. Their explicit paths/hashes must not be attributed to that checkout's
+    Git revision. External checkpoint bytes and CUDA library binaries are not
+    covered by this source fingerprint.
+    """
+    import jetspec_phase3
+    import jetspec_phase31
+    import jetspec_numeric_oracles
+    result = identity(args)
+    result["phase31_identity_script_sha256"] = result["script_sha256"]
+    script = Path(__file__).resolve()
+    result["qualification_script_path"] = str(script)
+    result["script_sha256"] = hashlib.sha256(script.read_bytes()).hexdigest()
+    helpers = {Path(module.__file__).resolve() for module in (
+        jetspec_phase3, jetspec_phase31, shared, jetspec_numeric_oracles)}
+    result["qualification_helper_sha256"] = {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(helpers)}
+    result["qualification_harness_source_sha256"] = hashlib.sha256(json.dumps({
+        "script": result["script_sha256"], "helpers": result["qualification_helper_sha256"]
+    }, sort_keys=True).encode()).hexdigest()
+    result["qualification_harness_external_to_selected_checkout"] = not script.is_relative_to(Path(args.repo).resolve())
+    result["oracle_sha256"] = hashlib.sha256(Path(args.oracle).read_bytes()).hexdigest()
+    result["fingerprint_scope"] = {
+        "covered": "selected production Python, loaded official JetSpec Python, this script and all direct/transitive benchmark helpers, oracle input",
+        "not_covered": "external Target/Draft checkpoint weight bytes, CUDA/cuBLAS/shared-library binaries",
+        "model_paths": {"target": args.target, "draft": args.draft},
+        "revision_scope": "revision belongs to --repo production tree; external diagnostic paths have separate explicit hashes"}
+    return result
 
 
 @contextmanager
@@ -195,7 +229,7 @@ def run(args):
     from nanovllm.speculative.jetspec import state as state_module
     from nanovllm.speculative.jetspec.packed_metadata import PackedTreeMetadata
     from jetspec_numeric_oracles import parent_chain
-    source = identity(args)
+    source = qualification_identity(args)
     prompts = {item["id"]: item for item in json.loads(Path(args.oracle).read_text())["prompts"]}
     torch.manual_seed(0)
     engine = None
@@ -207,6 +241,12 @@ def run(args):
         engine = LLM(args.target, enforce_eager=True, tensor_parallel_size=1,
             gpu_memory_utilization=0.8, max_num_seqs=8, max_num_batched_tokens=4096,
             max_model_len=4096, kvcache_block_size=256)
+        import nanovllm
+        report["loaded_nanovllm_path"] = str(Path(nanovllm.__file__).resolve())
+        require(Path(nanovllm.__file__).resolve().is_relative_to(Path(args.repo).resolve()),
+                "qualification imported production outside the selected checkout")
+        report["environment"] = {"torch": torch.__version__, "cuda": torch.version.cuda,
+                                 "gpu": torch.cuda.get_device_name(), "dtype": "bfloat16"}
         engine.configure_jetspec(args.draft, max_admissions_per_step=8)
         runtime = engine._jetspec_scheduler.runtime
         runtime.configure_optimizations(lightweight=True, batched_draft=True, feature_storage=True)
@@ -318,8 +358,11 @@ def run(args):
         engine.disable_jetspec()
         report["allocator_clean"] = not engine.scheduler.block_manager.used_block_ids
         require(report["allocator_clean"], "qualification leaked KV pages")
-        report["source_unchanged"] = identity(args)["production_source_sha256"] == source["production_source_sha256"]
+        after = qualification_identity(args)
+        report["source_unchanged"] = after["production_source_sha256"] == source["production_source_sha256"]
+        report["qualification_harness_unchanged"] = after["qualification_harness_source_sha256"] == source["qualification_harness_source_sha256"]
         require(report["source_unchanged"], "production changed during qualification")
+        require(report["qualification_harness_unchanged"], "diagnostic code changed during qualification")
         report["all_gates_passed"] = True
         save_json(args.output, report)
         print("ALL trained-model Phase4 qualification gates PASS", flush=True)

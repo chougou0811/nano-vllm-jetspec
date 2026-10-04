@@ -408,6 +408,151 @@ show BF16 GEMMs as the leading kernels rather than accepted KV copy or packed
 attention alone. Batched Draft, fewer host synchronizations and bounded
 batched/chunked prefill are the next candidates, not implemented in this phase.
 
+## JetSpec Phase 4: profile-driven serving optimization
+
+`configure_jetspec(..., optimization="serving")` now enables grouped Draft,
+lightweight round decisions and capacity-managed Target features. Use
+`optimization="debug"` for the previous full device checks/node records.
+Explicit packed runtime calls remain debug by default; the benchmark can select
+each optimization independently through `runtime.configure_optimizations()`.
+The synchronous scheduler, transaction publication boundary, canonical Target
+KV and runner-owned scratch ownership are unchanged.
+
+- **Grouped Draft:** compatible requests share one actual official DFlash head
+  forward. Rectangular old-prefix/new-suffix buffers use independent absolute
+  positions and an explicit per-row context/noise mask. Grouping bounds both
+  suffix and attention-key padding inflation to 2x. Only real context KV is
+  published into compact, independently allocated request caches; padding/noise
+  and batch-wide backing storage never become persistent request state.
+  Singletons, unsupported cache/backend types and dynamic/long RoPE variants
+  retain the official serial path. This is padded grouping, not paged Draft KV.
+- **Lightweight decisions:** one round-wide top-k download feeds the unchanged
+  official accum-logp heap; CPU topology/page ownership directly builds packed
+  metadata. One combined Target argmax download feeds independent acceptance
+  walks. Full per-node diagnostics, repeated device invariant comparisons and
+  per-round timing events are disabled in serving mode, not required host
+  ownership/bounds checks or stream lifetime fences. Debug can force full device
+  validation. The two required decision downloads and other small transfers
+  remain; this is not a synchronization-free or fully GPU-resident scheduler.
+- **Feature lifetime:** `target_hidden` remains the exact visible tensor prefix
+  required by the official head. Geometric backing capacity permits append-only
+  accepted taps, with history copies only on growth. Unpublished tails and
+  rollback-aware feature plans preserve precommit/postcommit failure semantics.
+  Preemption still releases features and reconstructs them on resume.
+- **Prefill:** only the final prompt row is projected through `lm_head` in
+  lightweight mode. Prefill/recompute otherwise remains request-local and
+  nonchunked. A resumed prefix exceeding `max_prefill_tokens` still produces
+  an explicit capacity error; configure this limit for the maximum recompute
+  prefix. Batched/chunked prefill is not implemented by this change.
+
+Capacity snapshots additionally expose live/reserved Target feature bytes and
+logical Draft cache bytes; Draft profiling also reports backing-storage and
+padding bytes. Admission still budgets physical Target KV pages, not a complete
+CUDA memory model. Feature spare capacity and batched Draft transient storage
+must not be mistaken for free memory.
+
+Qualification retains the Phase 3.1/3.2 finite-input numerical contract.
+Changed Draft GEMM/SDPA layouts and final-row prefill projection do not promise
+cross-shape token bitwise equality. Same-layout request/padding isolation,
+independent metadata reconstruction, all-layer raw KV copies, historical KV,
+exactly-once delivery and allocator cleanup remain strict gates.
+
+The matched benchmark imports clean `7bcb754` and the optimized checkout in
+separate workers using the same frozen driver, checkpoint identities, offered
+arrivals and 249-page pool. It covers mixed short/1024-token prompts, mixed tree
+budgets/output caps, two-wave arrivals and 128/512/1024 output caps. Delivery TPOT
+is measured from first to last delivered token, separately from offered-clock
+and submitted-clock TTFT/E2E; stage instrumentation and CUDA traces are separate
+from timed throughput samples. See [the driver](benchmarks/jetspec_phase4.py)
+and [trained-model qualification](benchmarks/jetspec_phase4_qualification.py).
+
+### Measured results
+
+[Phase 4 evidence](benchmarks/phase4_qualification.json) records 57 timed samples,
+524 requests and 142,976 emitted tokens on RTX 5090 / Qwen3-8B BF16, eager TP=1.
+The baseline is **Phase 3.2 JetSpec**, not ordinary AR. Each cell is baseline →
+optimized aggregate tok/s, followed by the ratio:
+
+| Residents | Output cap 128 | Output cap 512 | Output cap 1024 |
+|---|---:|---:|---:|
+| c1 | 73.14 → 76.66 (1.048x) | 99.88 → 104.92 (1.051x) | 121.35 → 126.20 (1.040x) |
+| c2 | 107.23 → 126.49 (1.180x) | 146.11 → 172.40 (1.180x) | 175.06 → 198.90 (1.136x) |
+| c4 | 149.81 → 181.87 (1.214x) | 186.57 → 233.73 (1.253x) | 210.32 → 261.92 (1.245x) |
+| c8 | 161.61 → 211.43 (1.308x) | 207.45 → 277.40 (1.337x) | 234.05 → 316.10 (1.351x) |
+
+c4/c8 at 128/512 use three-sample medians, including an ABBA repeat sequence;
+other cells are single timed samples. Every case has one warmup. Per-request
+caps are mixed `[M, M, M/2, M/4]`, not M for every request. Independent c16/128
+stress reached packed concurrency 16, 249.61 tok/s and clean completion of all
+32 requests; it has no c16 baseline and therefore no claimed speedup.
+
+The 512-token optimization ladder (lightweight includes final-row prefill
+projection; intermediate variants have one sample per case):
+
+| Residents | Baseline | Lightweight | + Feature storage | + Batched Draft |
+|---|---:|---:|---:|---:|
+| c1 | 99.88 | 100.68 | 103.05 | 104.92 |
+| c2 | 146.11 | 156.43 | 157.79 | 172.40 |
+| c4 | 186.57 | 202.95 | 205.03 | 233.73 |
+| c8 | 207.45 | 228.59 | 230.73 | 277.40 |
+
+At c8/512, pooled p50 offered TTFT/E2E improve from 3.886/17.680 s to
+2.965/12.994 s; submitted-clock TTFT/E2E from 3.804/17.535 s to 2.890/12.862 s.
+Delivery TPOT is 29.57 → 21.82 ms. Service residence is 9.006 → 6.743 s:
+this excludes nonresident queue/preemption time but is **not GPU busy time**.
+
+Separate c8/512 profiling shows Draft host/stream time 7.397/8.233 →
+3.040/3.095 s, with 1,230 serial proposals replaced by 280 actual B>1 head
+forwards and 79 singleton fallbacks. Mean output per verified request is
+4.558 → 4.570; the gain is not a large acceptance-rate change. Feature update
+copy payload falls 39.758 → 0.750 GB, but its standalone throughput benefit is
+small. Commit preparation host time actually rises 0.270 → 0.315 s; accepted
+KV copy remains only about 0.04 s and was not optimized.
+
+The late four-round trace has 23,637 → 13,246 `cudaLaunchKernel` calls and
+896 → 142 `cudaStreamSynchronize` calls. Explicit synchronization CPU time
+falls 164.03 → 1.76 ms, **but** `cudaMemcpyAsync` CPU time rises 11.37 →
+143.32 ms as pageable download waits move inside the copy API. This is fewer
+boundaries, not elimination of GPU waiting. Stage stream times include host
+launch gaps; nested stages must not be summed as GPU busy-time percentages.
+
+Target verification remains about 14.83 of 20.73 profiled stream seconds;
+packed attention alone is 38.5% of captured CUDA activity. Prefill is about
+1.00 s, so batched/chunked prefill was deferred. Next prioritize Target attention
+kernels and numerically qualified RMS/RoPE/activation fusion, then targeted
+CUDA Graph capture. Ordinary fused operators do not automatically preserve the
+reference BF16 rounding sequence. TP2 and page geometry are not the first
+bottlenecks demonstrated by this single-GPU workload.
+
+The fixed pool remains 249 pages / 63,744 slots / 9.399 GB. c8/512 peak leases
+remain 8,704 slots while peak CUDA allocated memory rises 28.805 → 28.949 GB;
+c8/1024 leases rise 11,008 → 11,520 slots as schedules change. c16 stress leases
+55 pages / 14,080 slots with 29.365 GB peak CUDA allocation. Shared scratch is
+retained while idle for reuse, then `disable_jetspec()` returns allocator
+occupancy to zero. No throughput-median regression was observed in the tested
+matrix; auxiliary memory and some local bookkeeping costs are real tradeoffs.
+
+Clean production qualification passes all 177 tests with CUDA gates enabled,
+plus actual-model isolation, metadata, raw KV and lifecycle gates. Across 315
+same-input Draft prediction rows, four cross-layout argmax flips are near ties;
+maximum relative RMS error is 0.791% for logits and 0.394% for KV, under the
+predeclared empirical 1.5625% envelope. This bound is not a numerical theorem;
+strict isolation/history gates provide separate semantic evidence. No exit 139
+recurred in these workers; the earlier unreproduced anomaly is not declared fixed.
+
+To reproduce a candidate run, use a clean checkout and the same driver as the
+baseline (omit the three optimization flags for clean `7bcb754`):
+
+```bash
+python benchmarks/jetspec_phase4.py --repo /path/to/clean-checkout \
+  --output candidate.json --concurrencies 1,2,4,8 --outputs 128,512,1024 \
+  --lightweight --feature-storage --batched-draft --compare baseline.json
+```
+
+The compact evidence includes raw-artifact hashes and paths; full traces remain
+outside Git. [The report generator](benchmarks/jetspec_phase4_report.py) pools
+completed repeats and checks matching provenance without rerunning GPU work.
+
 See [the qualification record](benchmarks/phase32_qualification.json) for
 both latency clocks, per-case acceptance/capacity, source fingerprints,
 final-code follow-up and clean-checkout test results. The formal timed runs
