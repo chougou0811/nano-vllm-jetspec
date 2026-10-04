@@ -2,8 +2,8 @@
 
 This is the execution boundary used by the Continuous Batching scheduler. Requests
 can be added, stepped in an arbitrary order, finished or cancelled between
-steps. Target verification is one real packed forward; Draft proposals remain
-per-request and share only immutable head weights.
+steps. Target verification is one real packed forward; serving mode also groups
+compatible Draft proposals while preserving compact, request-owned Draft KV.
 """
 from __future__ import annotations
 
@@ -75,11 +75,31 @@ class JetSpecBatchRuntime:
         self._active_transaction: BatchTreeTransaction | None = None
         self._closed = False
         self._reference_mode = False
+        self._lightweight = False
+        self._batched_draft_enabled = False
+        self._feature_storage = False
+        self._batch_proposer = None
         self.eos_token_ids = set()
         for value in (getattr(tokenizer, "eos_token_id", None),
                       getattr(getattr(target, "generation_config", None), "eos_token_id", None)):
             if value is not None:
                 self.eos_token_ids.update(value if isinstance(value, (list, tuple, set)) else [value])
+
+    def configure_optimizations(self, *, lightweight=False, batched_draft=False,
+                                feature_storage=False):
+        """Select independently measurable serving paths at an idle boundary."""
+        self._check_idle()
+        if self.requests:
+            raise RuntimeError("optimization policy cannot change with live requests")
+        self._lightweight = bool(lightweight)
+        self._batched_draft_enabled = bool(batched_draft)
+        self._feature_storage = bool(feature_storage)
+        self._batch_proposer = None
+
+    def _configure_state(self, state):
+        state.validate_device = not getattr(self, "_lightweight", False)
+        if getattr(self, "_feature_storage", False):
+            state.enable_feature_storage(max_capacity=self.max_model_len)
 
     def _check_idle(self) -> None:
         if self._closed:
@@ -123,13 +143,17 @@ class JetSpecBatchRuntime:
             ids[0], torch.arange(prompt_length, device=ids.device), None, None,
             self.target_layer_ids,
         )
-        anchor = self.target.lm_head(hidden)[-1].argmax().reshape(1, 1)
+        # Only the final prompt row predicts the first output. The debug path
+        # retains the qualified full-prefill GEMM shape for numerical controls.
+        head_input = hidden[-1:] if getattr(self, "_lightweight", False) else hidden
+        anchor = self.target.lm_head(head_input)[-1].argmax().reshape(1, 1)
         state = None
         try:
             state = PagedTargetState.from_prefill(
                 torch.cat((ids, anchor), 1), prompt_kv, taps.unsqueeze(0),
                 self.kv_pool, self.block_manager, self.block_size,
             )
+            self._configure_state(state)
             drafter = self._new_drafter()
             first = int(anchor.item())
             request = JetSpecRequest(
@@ -152,12 +176,18 @@ class JetSpecBatchRuntime:
         scratch = len(self.arena.blocks)
         live = sum(s.cache_len for s in states)
         reserved = (committed + pending + scratch) * self.block_size
+        features = [s.feature_storage_snapshot() for s in states]
+        from nanovllm.speculative.jetspec.batched_draft import BatchedDraftProposer
         return {"requests": len(states), "committed_blocks": committed,
                 "pending_destination_blocks": pending, "scratch_blocks": scratch,
                 "scratch_capacity_slots": self.arena.capacity,
                 "live_kv_slots": live, "reserved_kv_slots": reserved,
                 "allocator_used_blocks": len(self.block_manager.used_block_ids),
-                "amplification": reserved / live if live else None}
+                "amplification": reserved / live if live else None,
+                "target_feature_reserved_bytes": sum(s["feature_reserved_bytes"] for s in features),
+                "target_feature_live_bytes": sum(s.target_hidden.numel() * s.target_hidden.element_size() for s in states),
+                "draft_cache_bytes": BatchedDraftProposer._cache_bytes(self.requests.values()),
+                "memory_model": "admission budgets Target KV pages; auxiliary bytes are observed, not a full CUDA admission model"}
 
     def estimate_prefill_capacity(self, num_cached_tokens: int, tree_budget: int,
                                   remaining_outputs: int) -> dict:
@@ -250,6 +280,7 @@ class JetSpecBatchRuntime:
         try:
             state = PagedTargetState.from_prefill(ids, prompt_kv, taps.unsqueeze(0),
                 self.kv_pool, self.block_manager, self.block_size)
+            self._configure_state(state)
             request = JetSpecRequest(request_id, state, self._new_drafter(),
                 snapshot["tree_budget"], snapshot["max_new_tokens"], snapshot["ignore_eos"],
                 snapshot["prompt_length"], list(snapshot["output_ids"]), snapshot["created_at"],
@@ -280,13 +311,59 @@ class JetSpecBatchRuntime:
         )
         return self.target.lm_head(hidden), taps
 
+    def _propose_drafts(self, requests):
+        if not requests:
+            return []
+        if getattr(self, "_batched_draft_enabled", False) and hasattr(self, "head"):
+            if self._batch_proposer is None:
+                from nanovllm.speculative.jetspec.batched_draft import BatchedDraftProposer
+                self._batch_proposer = BatchedDraftProposer(self.head, self.target)
+            return self._batch_proposer.propose(requests, depth=self.tree_depth)
+        return [r.drafter.propose_logits(r.state.committed, self.tree_depth,
+                                        target_hidden=r.state.target_hidden) for r in requests]
+
+    def _build_trees(self, selected, budgets):
+        active = [r for r, budget in zip(selected, budgets) if budget > 1]
+        proposals = iter(self._propose_drafts(active)) if not self._reference_mode else iter(())
+        aligned = [next(proposals) if budget > 1 and not self._reference_mode else None for budget in budgets]
+        if (getattr(self, "_lightweight", False) and not self._reference_mode and
+                getattr(self.tree_algorithm, "name", None) == "accum_logp"):
+            from nanovllm.speculative.jetspec.serving_ops import build_trees
+            return build_trees([r.output_ids[-1] for r in selected], aligned, budgets,
+                               self.tree_depth, self.tree_width, self.kv_pool.device)
+        trees = []
+        for r, budget, draft_logits in zip(selected, budgets, aligned):
+            if self._reference_mode:
+                trees.append(SimpleNamespace(
+                    token_ids=torch.cat((r.state.committed[0, -1:], torch.zeros(
+                        budget - 1, dtype=torch.long, device=self.kv_pool.device))),
+                    depth=torch.cat((torch.zeros(1, dtype=torch.long, device=self.kv_pool.device),
+                                     torch.ones(budget - 1, dtype=torch.long, device=self.kv_pool.device))),
+                    num_nodes=budget, ancestor=torch.eye(budget, dtype=torch.bool, device=self.kv_pool.device)))
+            elif budget == 1:
+                trees.append(SimpleNamespace(
+                    token_ids=r.state.committed[0, -1:].clone(),
+                    depth=torch.zeros(1, dtype=torch.long, device=self.kv_pool.device),
+                    parent_indices=torch.full((1,), -1, dtype=torch.long, device=self.kv_pool.device),
+                    num_nodes=1, ancestor=torch.ones(1, 1, dtype=torch.bool, device=self.kv_pool.device)))
+            else:
+                trees.append(self.tree_algorithm.build(int(r.state.committed[0, -1]), draft_logits,
+                    self.tree_depth + 1, self.tree_width, budget, self.kv_pool.device))
+        return trees
+
+    def _accept_batch(self, logits, trees, metadata):
+        from nanovllm.speculative.jetspec.serving_ops import accept_batch
+        return accept_batch(logits, trees, metadata.query_offsets, self.tree_depth)
+
     @torch.inference_mode()
-    def step(self, requests=None, *, tree_budgets=None) -> dict[str, Any]:
+    def step(self, requests=None, *, tree_budgets=None, record_timing=None) -> dict[str, Any]:
         """One packed verify/commit with a single publication boundary.
 
         Failures before commit preserve every prefix. After physical commit,
         even a reporting error retains the newly committed output/state; the
         caller must not replay that round as if it had rolled back.
+        Timing events default off in lightweight serving; diagnostic wrappers
+        may explicitly request them without enabling full node records.
         """
         self._check_idle()
         selected = self._selected(requests)
@@ -298,6 +375,8 @@ class JetSpecBatchRuntime:
         from jetspec.tree import build_ancestor_matrix, gpu_tree_accept
         transaction = None
         publications = []
+        lightweight = getattr(self, "_lightweight", False) and not self._reference_mode
+        timed = not lightweight if record_timing is None else bool(record_timing)
 
         def publish_outputs():
             # All list/dict preparation precedes commit. These assignments are
@@ -308,118 +387,118 @@ class JetSpecBatchRuntime:
                 request.rounds = rounds
 
         try:
-            trees = []
-            for r, budget in zip(selected, budgets):
+            for r in selected:
                 r.state.assert_round_invariant()
-                if budget == 1 and not self._reference_mode:
-                    # Pressure/output-tail fallback: genuine root verification,
-                    # same packed attention/accept/commit, no useless Draft call.
-                    trees.append(SimpleNamespace(
-                        token_ids=r.state.committed[0, -1:].clone(),
-                        depth=torch.zeros(1, dtype=torch.long, device=self.kv_pool.device),
-                        parent_indices=torch.full((1,), -1, dtype=torch.long, device=self.kv_pool.device),
-                        num_nodes=1, ancestor=torch.ones(1, 1, dtype=torch.bool, device=self.kv_pool.device),
-                    ))
-                    continue
-                if self._reference_mode:
-                    # One genuine AR root and T-1 isolated dummy queries. This
-                    # is an explicit numerical comparator, never a serving path.
-                    n = budget
-                    trees.append(SimpleNamespace(
-                        token_ids=torch.cat((r.state.committed[0, -1:], torch.zeros(
-                            n - 1, dtype=torch.long, device=self.kv_pool.device))),
-                        depth=torch.cat((torch.zeros(1, dtype=torch.long, device=self.kv_pool.device),
-                                         torch.ones(n - 1, dtype=torch.long, device=self.kv_pool.device))),
-                        num_nodes=n, ancestor=torch.eye(n, dtype=torch.bool, device=self.kv_pool.device),
-                    ))
-                    continue
-                draft_logits = r.drafter.propose_logits(
-                    r.state.committed, self.tree_depth, target_hidden=r.state.target_hidden,
-                )
-                trees.append(self.tree_algorithm.build(
-                    int(r.state.committed[0, -1]), draft_logits,
-                    self.tree_depth + 1, self.tree_width, budget, self.kv_pool.device,
-                ))
+            trees = self._build_trees(selected, budgets)
             transaction = BatchTreeTransaction.admit(
                 [r.state for r in selected], [int(t.num_nodes) for t in trees],
                 [min(int(t.num_nodes), self.tree_depth + 1, r.max_new_tokens - len(r.output_ids))
                  for r, t in zip(selected, trees)], self.arena,
             )
             self._active_transaction = transaction
-            metadata = PackedTreeMetadata.build(
-                [r.state.cache_len for r in selected], [r.state.owned_blocks for r in selected],
-                transaction.node_slots, [build_ancestor_matrix(t).bool() for t in trees],
-                self.block_size, request_ids=[r.request_id for r in selected],
-            )
+            if lightweight and all(hasattr(t, "host_ancestor") for t in trees):
+                metadata = PackedTreeMetadata.from_host_trees(
+                    [r.state.cache_len for r in selected], [r.state.owned_blocks for r in selected],
+                    trees, self.arena.blocks, self.block_size, device=self.kv_pool.device,
+                    request_ids=[r.request_id for r in selected])
+            else:
+                metadata = PackedTreeMetadata.build(
+                    [r.state.cache_len for r in selected], [r.state.owned_blocks for r in selected],
+                    transaction.node_slots, [build_ancestor_matrix(t).bool() for t in trees],
+                    self.block_size, request_ids=[r.request_id for r in selected])
             capacity_during_verify = self.capacity_snapshot()
-            verify_start, verify_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            verify_start.record()
+            if timed:
+                verify_start, verify_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                verify_start.record()
             logits, taps = self._verify_batch(selected, trees, transaction, metadata)
-            verify_end.record()
+            if timed:
+                verify_end.record()
+            accepted = self._accept_batch(logits, trees, metadata) if lightweight else None
             paths, next_tokens, features, request_records = [], [], [], []
+            host_paths = []
             for i, (r, tree) in enumerate(zip(selected, trees)):
                 lo, hi = metadata.query_offsets[i:i + 2]
-                request_logits = logits[lo:hi]
-                greedy = request_logits.argmax(-1)
-                if self._reference_mode:
-                    raw_path = torch.zeros(1, dtype=torch.long, device=greedy.device)
-                    accepted_len, correction = 0, greedy[0]
+                if lightweight:
+                    outcome = accepted[i]
+                    values = outcome["outputs"]
+                    raw_path_host = outcome["path"]
+                    accepted_len = outcome["accepted_length"]
+                    correction_id = outcome["correction"]
                 else:
-                    raw_path, accepted_len, correction = gpu_tree_accept(
-                        tree.token_ids, greedy, tree.parent_indices, tree.depth, max_depth=self.tree_depth,
-                    )
-                raw_outputs = torch.cat((tree.token_ids.index_select(0, raw_path[1:]), correction.reshape(1)))
-                values = [int(x) for x in raw_outputs.tolist()]
+                    greedy = logits[lo:hi].argmax(-1)
+                    if self._reference_mode:
+                        raw_path = torch.zeros(1, dtype=torch.long, device=greedy.device)
+                        accepted_len, correction = 0, greedy[0]
+                    else:
+                        raw_path, accepted_len, correction = gpu_tree_accept(
+                            tree.token_ids, greedy, tree.parent_indices, tree.depth, max_depth=self.tree_depth)
+                    raw_outputs = torch.cat((tree.token_ids.index_select(0, raw_path[1:]), correction.reshape(1)))
+                    values = [int(x) for x in raw_outputs.tolist()]
+                    raw_path_host = [int(x) for x in raw_path.tolist()]
+                    correction_id = int(correction.item())
                 limit = min(len(values), r.max_new_tokens - len(r.output_ids))
                 if not r.ignore_eos:
                     first_eos = next((j for j, token in enumerate(values[:limit]) if token in self.eos_token_ids), None)
                     if first_eos is not None:
                         limit = first_eos + 1
-                path = raw_path[:limit]
-                if not torch.equal(tree.depth.index_select(0, path.long()),
-                                   torch.arange(path.numel(), device=path.device)):
-                    raise RuntimeError("accepted RoPE positions do not match canonical tail")
+                path_host = raw_path_host[:limit]
+                if lightweight:
+                    path = torch.tensor(path_host, dtype=torch.long)
+                    block = torch.tensor(values[:limit], dtype=torch.long, device=self.kv_pool.device)
+                else:
+                    path = raw_path[:limit]
+                    if not torch.equal(tree.depth.index_select(0, path.long()),
+                                       torch.arange(path.numel(), device=path.device)):
+                        raise RuntimeError("accepted RoPE positions do not match canonical tail")
+                    block = raw_outputs[:limit]
                 # Truncate the cached path with the emitted prefix, leaving its
                 # last emitted token uncached even at EOS or max-token boundary.
-                block = raw_outputs[:limit]
                 paths.append(path)
+                host_paths.append(path_host)
                 next_tokens.append(torch.cat((r.state.committed, block.reshape(1, -1)), 1))
                 features.append(taps[lo:hi].unsqueeze(0))
                 record = {
                     "request_id": r.request_id, "tree_size": int(tree.num_nodes),
                     "effective_tree_budget": budgets[i],
                     "accepted_draft_length": int(accepted_len),
-                    "committed_path_indices": [int(x) for x in path.tolist()],
-                    "raw_accepted_path_indices": [int(x) for x in raw_path.tolist()],
-                    "verification_correction_token_id": int(correction.item()),
+                    "committed_path_indices": path_host,
+                    "raw_accepted_path_indices": raw_path_host,
+                    "verification_correction_token_id": correction_id,
                     "output_block": values[:limit],
-                    "target_argmax_by_node": [int(x) for x in greedy.tolist()],
                     "kv_length": r.state.cache_len + int(path.numel()),
                     "feature_length": r.state.cache_len + int(path.numel()),
                     "committed_minus_one": int(next_tokens[-1].shape[1]) - 1,
                 }
+                if not lightweight:
+                    record["target_argmax_by_node"] = [int(x) for x in greedy.tolist()]
                 request_records.append(record)
                 next_output_ids = r.output_ids + values[:limit]
                 finished = (len(next_output_ids) >= r.max_new_tokens or
                             (not r.ignore_eos and next_output_ids[-1] in self.eos_token_ids))
                 publications.append((r, next_output_ids, finished, r.rounds + [record]))
-            commit_start, commit_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            commit_start.record()
-            lifecycle = transaction.commit(features, paths, next_tokens)
+            if timed:
+                commit_start, commit_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                commit_start.record()
+            if lightweight:
+                lifecycle = transaction.commit(features, paths, next_tokens, accepted_paths_host=host_paths)
+            else:
+                lifecycle = transaction.commit(features, paths, next_tokens)
             publish_outputs()
-            commit_end.record()
+            if timed:
+                commit_end.record()
             self._active_transaction = None
             for r in selected:
                 r.state.assert_round_invariant()
-            return {"request_ids": [r.request_id for r in selected],
+            result = {"request_ids": [r.request_id for r in selected],
                     "node_counts": [int(t.num_nodes) for t in trees],
                     "total_query_tokens": int(logits.shape[0]),
                     "cu_seqlens_q": list(metadata.query_offsets),
                     "requests": request_records, "lifecycle": lifecycle,
                     "capacity_during_verify": capacity_during_verify,
-                    "capacity": self.capacity_snapshot(),
-                    "_verify_events": (verify_start, verify_end),
-                    "_commit_events": (commit_start, commit_end)}
+                    "capacity": self.capacity_snapshot()}
+            if timed:
+                result.update(_verify_events=(verify_start, verify_end), _commit_events=(commit_start, commit_end))
+            return result
         except BaseException:
             if transaction is not None:
                 if getattr(transaction, "committed", not transaction.active):
@@ -504,7 +583,7 @@ class JetSpecBatchRuntime:
                         completed[r.request_id] = self.finish(r)
                 if not self.requests:
                     break
-                record = self.step()
+                record = self.step(record_timing=True)
                 peak_slots = max(peak_slots, record["capacity_during_verify"]["reserved_kv_slots"])
                 rounds.append(record)
             torch.cuda.synchronize(self.kv_pool.device)

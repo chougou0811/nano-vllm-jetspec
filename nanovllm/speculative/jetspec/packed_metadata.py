@@ -125,6 +125,78 @@ class PackedTreeMetadata:
             request_ids=ids,
         )
 
+    @classmethod
+    def from_host_trees(cls, prefix_lens, block_tables, trees, arena_blocks,
+                        block_size, *, device, request_ids):
+        """Construct serving metadata from validated CPU topology/ownership.
+
+        The allocator's page list and the tree builder's CPU topology are the
+        sources of truth. This avoids downloading freshly uploaded masks/slots
+        merely to validate them again. The fully device-validated build() remains
+        available for qualification and arbitrary external device metadata.
+        """
+        import numpy as np
+
+        prefixes = tuple(int(v) for v in prefix_lens)
+        tables = tuple(tuple(int(v) for v in table) for table in block_tables)
+        ids = tuple(request_ids)
+        count = len(prefixes)
+        if not count or not (len(tables) == len(trees) == len(ids) == count):
+            raise ValueError("packed metadata request lists must align")
+        if block_size <= 0 or any(v < 0 for v in prefixes) or len(set(ids)) != count:
+            raise ValueError("invalid packed prefix geometry or duplicate request ID")
+        counts, offsets, bias_offsets = [], [0], [0]
+        query_requests, local_rows, biases = [], [], []
+        live_pages = set()
+        for i, (prefix, table, tree) in enumerate(zip(prefixes, tables, trees)):
+            if len(table) != (prefix + block_size - 1) // block_size or len(set(table)) != len(table) or any(v < 0 for v in table):
+                raise ValueError("prefix block table must be a tight canonical page table")
+            n = int(tree.num_nodes)
+            ancestor = tree.host_ancestor
+            if ancestor.device.type != "cpu" or ancestor.dtype != torch.bool or ancestor.shape != (n, n) or n < 1:
+                raise ValueError("host ancestor must be a nonempty boolean square matrix")
+            mask = ancestor.numpy()
+            if not mask.diagonal().all() or np.triu(mask, 1).any():
+                raise ValueError("ancestor mask must include self and be locally causal")
+            # Validate parents/depth against the actual visibility relation.
+            parents, depths = tree.host_parents, tree.host_depths
+            if len(parents) != n or len(depths) != n or parents[0] != -1 or depths[0] != 0:
+                raise ValueError("invalid root topology")
+            for node in range(1, n):
+                parent = parents[node]
+                if not 0 <= parent < node or depths[node] != depths[parent] + 1:
+                    raise ValueError("tree parent/depth mismatch")
+                expected = mask[parent].copy()
+                expected[node] = True
+                if not np.array_equal(expected, mask[node]):
+                    raise ValueError("ancestor visibility differs from parent topology")
+            counts.append(n)
+            offsets.append(offsets[-1] + n)
+            bias_offsets.append(bias_offsets[-1] + n * n)
+            query_requests.extend([i] * n)
+            local_rows.extend(range(n))
+            biases.append(np.where(mask, np.float32(0), np.float32(-np.inf)).reshape(-1))
+            live_pages.update(table)
+        pages = tuple(int(v) for v in arena_blocks)
+        if len(pages) * block_size < offsets[-1] or len(set(pages)) != len(pages) or any(v < 0 for v in pages):
+            raise ValueError("invalid or insufficient scratch page ownership")
+        if live_pages.intersection(pages):
+            raise ValueError("scratch pages overlap a live committed prefix")
+        slots = tuple(pages[j // block_size] * block_size + j % block_size for j in range(offsets[-1]))
+        width = max(1, max(len(table) for table in tables))
+        table_values = [v for table in tables for v in (*table, *([-1] * (width - len(table))))]
+        arrays = [offsets, query_requests, local_rows, list(prefixes), table_values, counts]
+        integer = torch.tensor([v for array in arrays for v in array], dtype=torch.int32, device=device)
+        views, cursor = [], 0
+        for array in arrays:
+            views.append(integer[cursor:cursor + len(array)])
+            cursor += len(array)
+        addresses = torch.tensor((*slots, *bias_offsets), dtype=torch.int64, device=device)
+        bias = torch.from_numpy(np.concatenate(biases)).to(device)
+        return cls(views[0], views[1], views[2], views[3], views[4].view(count, width),
+                   addresses[:len(slots)], bias, addresses[len(slots):], views[5],
+                   block_size, prefixes, tuple(offsets), tuple(counts), tables, slots, ids)
+
     @property
     def num_requests(self) -> int:
         return len(self.prefix_lengths)

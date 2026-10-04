@@ -51,7 +51,8 @@ class LLMEngine:
     def configure_jetspec(self, draft_model: str, *, tree_depth: int = 15,
                          tree_width: int = 7, max_tree_budget: int = 63,
                          default_tree_budget: int = 63, max_admissions_per_step: int = 2,
-                         max_prefill_tokens: int | None = None):
+                         max_prefill_tokens: int | None = None,
+                         optimization: str = "serving"):
         """Select the greedy Continuous Batching adapter for add/step/cancel.
 
         Like nano-vLLM's ordinary engine this is a synchronous event loop, not
@@ -65,10 +66,15 @@ class LLMEngine:
             self.disable_jetspec()
         if not 1 <= default_tree_budget <= max_tree_budget:
             raise ValueError("default tree budget must fit the configured maximum")
+        if optimization not in ("serving", "debug"):
+            raise ValueError("JetSpec optimization must be 'serving' or 'debug'")
         runtime = self.get_jetspec_batch_runtime(draft_model, tree_depth=tree_depth,
             tree_width=tree_width, max_tree_budget=max_tree_budget)
         if runtime.requests:
             raise RuntimeError("cannot enter serving mode with explicit packed requests")
+        optimized = optimization == "serving"
+        runtime.configure_optimizations(lightweight=optimized, batched_draft=optimized,
+                                        feature_storage=optimized)
         from nanovllm.engine.jetspec_scheduler import JetSpecScheduler
         config = self.model_runner.config
         self._jetspec_scheduler = JetSpecScheduler(runtime, config.max_num_seqs,
@@ -90,6 +96,8 @@ class LLMEngine:
         cached = getattr(self, "_jetspec_batch_runtime", None)
         if cached is not None and not cached[1]._closed:
             cached[1].release_idle_scratch()
+            if not cached[1].requests:
+                cached[1].configure_optimizations()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams,
                     *, tree_budget: int | None = None, request_id: str | int | None = None):

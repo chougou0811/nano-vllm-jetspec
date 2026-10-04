@@ -173,6 +173,17 @@ class _TreeRound:
 
 
 @dataclass
+class _FeatureAppendPlan:
+    hidden: torch.Tensor
+    storage: torch.Tensor | None
+    append_bytes: int
+    history_bytes: int
+    next_append_bytes: int
+    next_history_bytes: int
+    next_growths: int
+
+
+@dataclass
 class PagedTargetState:
     """Canonical committed KV plus one bounded, reusable tree transaction arena."""
 
@@ -188,6 +199,12 @@ class PagedTargetState:
     _round: _TreeRound | None = field(default=None, repr=False)
     _batch_transaction: object | None = field(default=None, repr=False)
     _cleared: bool = field(default=False, repr=False)
+    validate_device: bool = True
+    _feature_storage: torch.Tensor | None = field(default=None, repr=False)
+    _feature_max_capacity: int | None = field(default=None, repr=False)
+    _feature_append_bytes: int = field(default=0, repr=False)
+    _feature_history_bytes: int = field(default=0, repr=False)
+    _feature_growths: int = field(default=0, repr=False)
 
     @classmethod
     def from_prefill(
@@ -249,6 +266,113 @@ class PagedTargetState:
     @property
     def cache_len(self) -> int:
         return int(self.logical_slots.numel())
+
+    @property
+    def feature_capacity(self) -> int:
+        buffer = self._feature_storage if self._feature_storage is not None else self.target_hidden
+        return int(buffer.shape[1]) if buffer.ndim == 3 else 0
+
+    def feature_storage_snapshot(self) -> dict[str, int | bool]:
+        buffer = self._feature_storage if self._feature_storage is not None else self.target_hidden
+        return {"feature_storage_enabled": self._feature_storage is not None,
+                "feature_capacity_tokens": self.feature_capacity,
+                "feature_live_tokens": int(self.target_hidden.shape[1]) if self.target_hidden.ndim == 3 else 0,
+                "feature_reserved_bytes": int(buffer.numel() * buffer.element_size()),
+                "feature_append_copy_bytes": self._feature_append_bytes,
+                "feature_history_copy_bytes": self._feature_history_bytes,
+                "feature_copy_bytes": self._feature_append_bytes + self._feature_history_bytes,
+                "feature_growths": self._feature_growths}
+
+    def enable_feature_storage(self, initial_capacity: int | None = None,
+                               max_capacity: int | None = None) -> dict:
+        """Opt into append-only feature capacity without changing the tensor API.
+
+        The default reuses the current feature tensor as the initial backing;
+        geometric growth copies history only when capacity is exhausted. An
+        explicit capacity can reserve a request's known output limit up front.
+        Commits write only the not-yet-visible tail, then publish a longer view.
+        Old visible views/prefix bytes therefore survive preparation or abort.
+        Legacy states retain the original torch.cat behavior by default.
+        """
+        if self._cleared:
+            raise RuntimeError("cannot enable feature storage for a cleared request")
+        self.assert_round_invariant()
+        if self.target_hidden.ndim != 3 or self.target_hidden.shape[0] != 1:
+            raise ValueError("target features must have shape [1, tokens, width]")
+        if self._feature_storage is not None:
+            if initial_capacity is not None or max_capacity is not None:
+                raise RuntimeError("feature storage is already enabled")
+            return self.feature_storage_snapshot()
+        length = int(self.target_hidden.shape[1])
+        capacity = length if initial_capacity is None else initial_capacity
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < length:
+            raise ValueError("initial feature capacity cannot be smaller than live history")
+        if max_capacity is not None and (isinstance(max_capacity, bool) or not isinstance(max_capacity, int)
+                                          or max_capacity < capacity):
+            raise ValueError("maximum feature capacity cannot be smaller than initial capacity")
+        buffer = self.target_hidden
+        copied = 0
+        if capacity > length:
+            buffer = torch.empty((1, capacity, self.target_hidden.shape[2]),
+                                 dtype=self.target_hidden.dtype, device=self.target_hidden.device)
+            buffer[:, :length].copy_(self.target_hidden)
+            copied = int(self.target_hidden.numel() * self.target_hidden.element_size())
+            if self.kv_pool.is_cuda and self.scratch is not None:
+                # assert_round_invariant waited for the old readiness event.
+                # Retain this feature copy's new dependency for a different
+                # stream's first Draft/read or request cleanup.
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(self.kv_pool.device))
+                self.scratch._retired = event
+        self._feature_storage = buffer
+        self._feature_max_capacity = max_capacity
+        self._feature_history_bytes += copied
+        self._feature_growths += int(capacity > length)
+        self.target_hidden = buffer[:, :length]
+        return self.feature_storage_snapshot()
+
+    def _prepare_feature_append(self, payload: torch.Tensor) -> _FeatureAppendPlan:
+        if (payload.ndim != 3 or tuple(payload.shape[:1]) != (1,)
+                or payload.shape[2:] != self.target_hidden.shape[2:]
+                or (self._feature_storage is not None and payload.dtype != self.target_hidden.dtype)
+                or payload.device != self.target_hidden.device):
+            raise ValueError("accepted features and committed feature geometry differ")
+        length = int(self.target_hidden.shape[1])
+        next_length = length + int(payload.shape[1])
+        append_bytes = int(payload.numel() * payload.element_size())
+        history_bytes = 0
+        growths = self._feature_growths
+        buffer = self._feature_storage
+        if buffer is None:
+            hidden = torch.cat((self.target_hidden, payload), dim=1)
+            history_bytes = int(self.target_hidden.numel() * self.target_hidden.element_size())
+        else:
+            if next_length > buffer.shape[1]:
+                capacity = max(next_length, max(1, int(buffer.shape[1]) * 2))
+                if self._feature_max_capacity is not None:
+                    if next_length > self._feature_max_capacity:
+                        raise RuntimeError("accepted features exceed the configured capacity limit")
+                    capacity = min(capacity, self._feature_max_capacity)
+                buffer = torch.empty((1, capacity, self.target_hidden.shape[2]),
+                                     dtype=self.target_hidden.dtype, device=self.target_hidden.device)
+                buffer[:, :length].copy_(self.target_hidden)
+                history_bytes = int(self.target_hidden.numel() * self.target_hidden.element_size())
+                growths += 1
+            # This region is not part of the old published target_hidden view.
+            # A failed transaction can leave arbitrary bytes here; the next
+            # preparation overwrites them before making them reachable.
+            buffer[:, length:next_length].copy_(payload)
+            hidden = buffer[:, :next_length]
+        return _FeatureAppendPlan(hidden, buffer, append_bytes, history_bytes,
+                                  self._feature_append_bytes + append_bytes,
+                                  self._feature_history_bytes + history_bytes, growths)
+
+    def _publish_features(self, plan: _FeatureAppendPlan) -> None:
+        self.target_hidden = plan.hidden
+        self._feature_storage = plan.storage
+        self._feature_append_bytes = plan.next_append_bytes
+        self._feature_history_bytes = plan.next_history_bytes
+        self._feature_growths = plan.next_growths
 
     @property
     def scratch_blocks(self) -> list[int]:
@@ -369,7 +493,7 @@ class PagedTargetState:
             start=self.cache_len,
         )
         next_slots = torch.cat((self.logical_slots, destination))
-        next_hidden = torch.cat((self.target_hidden, node_hidden.index_select(1, selected)), dim=1)
+        feature_plan = self._prepare_feature_append(node_hidden.index_select(1, selected))
         needed_blocks = (next_length + self.block_size - 1) // self.block_size
         used_destination = needed_blocks - len(self.owned_blocks)
         retained = self.pending_blocks[:used_destination]
@@ -383,7 +507,7 @@ class PagedTargetState:
         self.owned_blocks = next_owned_blocks
         self.pending_blocks = []
         self.logical_slots = next_slots
-        self.target_hidden = next_hidden
+        self._publish_features(feature_plan)
         if committed_tokens is not None:
             self.committed = committed_tokens
         self._round = None
@@ -395,6 +519,10 @@ class PagedTargetState:
             "rejected_logical_slots": int(node_slots.numel() - len(path)),
             "accepted_kv_slots": len(path),
             "kv_copy_bytes": copy_bytes,
+            **self.feature_storage_snapshot(),
+            "feature_append_copy_bytes": feature_plan.append_bytes,
+            "feature_history_copy_bytes": feature_plan.history_bytes,
+            "feature_copy_bytes": feature_plan.append_bytes + feature_plan.history_bytes,
         }
 
     def abort_tree(self) -> int:
@@ -415,7 +543,7 @@ class PagedTargetState:
         self._round = None
         return released
 
-    def assert_round_invariant(self) -> None:
+    def assert_round_invariant(self, *, validate_device: bool | None = None) -> None:
         if self.scratch is not None:
             self.scratch.wait_ready()
         expected = int(self.committed.shape[1]) - 1
@@ -430,11 +558,24 @@ class PagedTargetState:
         expected_blocks = (self.cache_len + self.block_size - 1) // self.block_size
         if len(self.owned_blocks) != expected_blocks:
             raise RuntimeError("committed pages are not tightly allocated")
-        canonical = _slots_for_blocks(
-            self.owned_blocks, self.cache_len, self.block_size, self.kv_pool.device,
-        )
-        if not torch.equal(canonical, self.logical_slots):
-            raise RuntimeError("committed slot map is not canonical")
+        check_device = self.validate_device if validate_device is None else validate_device
+        if check_device:
+            canonical = _slots_for_blocks(
+                self.owned_blocks, self.cache_len, self.block_size, self.kv_pool.device,
+            )
+            if not torch.equal(canonical, self.logical_slots):
+                raise RuntimeError("committed slot map is not canonical")
+        if self._feature_storage is not None:
+            if (self._feature_storage.ndim != 3 or self.target_hidden.ndim != 3
+                    or self._feature_storage.shape[0] != 1
+                    or self._feature_storage.shape[1] < expected
+                    or self._feature_storage.shape[2:] != self.target_hidden.shape[2:]
+                    or self._feature_storage.dtype != self.target_hidden.dtype
+                    or self._feature_storage.device != self.target_hidden.device
+                    or self.target_hidden.untyped_storage().data_ptr() != self._feature_storage.untyped_storage().data_ptr()
+                    or self.target_hidden.storage_offset() != self._feature_storage.storage_offset()
+                    or self.target_hidden.stride() != self._feature_storage.stride()):
+                raise RuntimeError("committed feature view differs from its backing capacity")
         all_blocks = self.owned_blocks + self.scratch_blocks
         if len(set(all_blocks)) != len(all_blocks):
             raise RuntimeError("committed and tree scratch block ownership overlaps")
@@ -461,6 +602,11 @@ class PagedTargetState:
         self.owned_blocks = []
         self.logical_slots = torch.empty(0, dtype=torch.long, device=self.kv_pool.device)
         self.target_hidden = torch.empty(0, device=self.kv_pool.device)
+        self._feature_storage = None
+        self._feature_max_capacity = None
+        self._feature_append_bytes = 0
+        self._feature_history_bytes = 0
+        self._feature_growths = 0
         self.committed = torch.empty(0, dtype=torch.long, device=self.kv_pool.device)
         self._cleared = True
         return released
@@ -477,6 +623,7 @@ class _BatchCommitPlan:
     unused_blocks: list[int]
     accepted_count: int
     copy_bytes: int
+    features: _FeatureAppendPlan
 
 
 @dataclass
@@ -604,11 +751,24 @@ class BatchTreeTransaction:
         path: torch.Tensor,
         maximum: int,
         tokens: torch.Tensor,
+        *,
+        accepted_path_host: list[int] | tuple[int, ...] | None = None,
     ) -> _BatchCommitPlan:
         if path.ndim != 1:
             raise ValueError("accepted path must be one-dimensional")
-        selected = path.to(device=nodes.device, dtype=torch.long)
-        indices = selected.tolist()
+        if accepted_path_host is None:
+            selected = path.to(device=nodes.device, dtype=torch.long)
+            indices = selected.tolist()
+        else:
+            # The host path is authoritative, not a hint about another GPU
+            # tensor's values. Reconstruct source indices from the validated
+            # list so a stale/mismatched device tensor cannot address wrong KV.
+            indices = list(accepted_path_host)
+            if any(isinstance(index, bool) or not isinstance(index, int) for index in indices):
+                raise ValueError("accepted host path must contain integer node indices")
+            if path.numel() != len(indices):
+                raise ValueError("accepted host and supplied path lengths differ")
+            selected = torch.tensor(indices, dtype=torch.long, device=nodes.device)
         if not indices or indices[0] != 0 or len(set(indices)) != len(indices):
             raise ValueError("accepted path must be root-inclusive and contain unique nodes")
         if min(indices) < 0 or max(indices) >= nodes.numel() or len(indices) > maximum:
@@ -624,7 +784,7 @@ class BatchTreeTransaction:
             state.block_size, state.kv_pool.device, start=state.cache_len,
         )
         next_slots = torch.cat((state.logical_slots, destination))
-        next_hidden = torch.cat((state.target_hidden, node_hidden.index_select(1, selected)), dim=1)
+        feature_plan = state._prepare_feature_append(node_hidden.index_select(1, selected))
         needed = (next_length + state.block_size - 1) // state.block_size
         used_destination = needed - len(state.owned_blocks)
         retained = state.pending_blocks[:used_destination]
@@ -633,8 +793,8 @@ class BatchTreeTransaction:
         next_owned = state.owned_blocks + retained
         bytes_per_slot = int(state.kv_pool.shape[0] * state.kv_pool.shape[1] * state.kv_pool.shape[4] * state.kv_pool.shape[5] * state.kv_pool.element_size())
         return _BatchCommitPlan(
-            source, destination, next_slots, next_hidden, tokens, next_owned,
-            unused, len(indices), len(indices) * bytes_per_slot,
+            source, destination, next_slots, feature_plan.hidden, tokens, next_owned,
+            unused, len(indices), len(indices) * bytes_per_slot, feature_plan,
         )
 
     def commit(
@@ -642,17 +802,31 @@ class BatchTreeTransaction:
         node_hidden: list[torch.Tensor],
         accepted_paths: list[torch.Tensor],
         committed_tokens: list[torch.Tensor],
+        *,
+        accepted_paths_host: list[list[int] | tuple[int, ...]] | None = None,
     ) -> dict:
+        """Commit validated paths; optional host lists are authoritative indices.
+
+        The default retains full device-to-host path validation. An internal
+        batched acceptance extractor may supply already-materialized CPU lists;
+        these still receive all host root/uniqueness/bounds/shape checks, and are
+        used to construct the actual index tensors (never trust unchecked GPU
+        values that merely claim to match them).
+        """
         if not self.active or self.committed:
             raise RuntimeError("packed tree transaction is no longer active")
         self.arena.check_stream()
         if len(node_hidden) != len(self.states) or len(accepted_paths) != len(self.states) or len(committed_tokens) != len(self.states):
             raise ValueError("batch commit inputs must align with admitted requests")
+        if accepted_paths_host is not None and len(accepted_paths_host) != len(self.states):
+            raise ValueError("accepted host paths must align with admitted requests")
+        host_paths = [None] * len(self.states) if accepted_paths_host is None else accepted_paths_host
         plans = [
-            self._prepare_commit(state, nodes, hidden, path, maximum, tokens)
-            for state, nodes, hidden, path, maximum, tokens in zip(
+            self._prepare_commit(state, nodes, hidden, path, maximum, tokens,
+                                 accepted_path_host=host)
+            for state, nodes, hidden, path, maximum, tokens, host in zip(
                 self.states, self.node_slots, node_hidden, accepted_paths,
-                self.max_path_lengths, committed_tokens,
+                self.max_path_lengths, committed_tokens, host_paths,
             )
         ]
         source = torch.cat([plan.source for plan in plans])
@@ -667,12 +841,20 @@ class BatchTreeTransaction:
                 "released_blocks": len(plan.unused_blocks),
                 "committed_blocks": len(plan.next_owned_blocks),
                 "live_kv_slots": int(plan.next_slots.numel()),
+                "feature_storage_enabled": plan.features.storage is not None,
+                "feature_capacity_tokens": int((plan.features.storage if plan.features.storage is not None else plan.next_hidden).shape[1]),
+                "feature_reserved_bytes": int((plan.features.storage if plan.features.storage is not None else plan.next_hidden).numel() * plan.next_hidden.element_size()),
+                "feature_append_copy_bytes": plan.features.append_bytes,
+                "feature_history_copy_bytes": plan.features.history_bytes,
+                "feature_copy_bytes": plan.features.append_bytes + plan.features.history_bytes,
+                "feature_growths": plan.features.next_growths,
             }
             for plan, nodes, count in zip(plans, self.node_slots, self.destination_counts)
         ]
         original = [
             (state.owned_blocks, state.pending_blocks, state.logical_slots,
-             state.target_hidden, state.committed)
+             state.target_hidden, state.committed, state._feature_storage,
+             state._feature_append_bytes, state._feature_history_bytes, state._feature_growths)
             for state in self.states
         ]
         committed_blocks = sum(len(plan.next_owned_blocks) for plan in plans)
@@ -697,6 +879,10 @@ class BatchTreeTransaction:
             "reserved_blocks": self.newly_reserved_blocks,
             "reserved_destination_blocks": sum(self.destination_counts),
             "released_blocks": len(unused),
+            "feature_append_copy_bytes": sum(plan.features.append_bytes for plan in plans),
+            "feature_history_copy_bytes": sum(plan.features.history_bytes for plan in plans),
+            "feature_copy_bytes": sum(plan.features.append_bytes + plan.features.history_bytes for plan in plans),
+            "feature_reserved_bytes": sum(metric["feature_reserved_bytes"] for metric in request_metrics),
         }
         self.result = result
         copy_bytes = copy_accepted_kv(self.arena.kv_pool, source, destination, self.arena.block_size)
@@ -710,7 +896,7 @@ class BatchTreeTransaction:
                 state.owned_blocks = plan.next_owned_blocks
                 state.pending_blocks = []
                 state.logical_slots = plan.next_slots
-                state.target_hidden = plan.next_hidden
+                state._publish_features(plan.features)
                 state.committed = plan.next_tokens
             self._published = True
             self.arena.block_manager.release_provisional(unused)
@@ -731,7 +917,9 @@ class BatchTreeTransaction:
                 self.finish_committed()
                 raise
             for state, previous in zip(self.states, original):
-                state.owned_blocks, state.pending_blocks, state.logical_slots, state.target_hidden, state.committed = previous
+                (state.owned_blocks, state.pending_blocks, state.logical_slots,
+                 state.target_hidden, state.committed, state._feature_storage,
+                 state._feature_append_bytes, state._feature_history_bytes, state._feature_growths) = previous
             self._published = False
             raise
         self.finish_committed()
