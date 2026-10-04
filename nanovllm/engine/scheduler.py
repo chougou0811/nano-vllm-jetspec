@@ -22,12 +22,24 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
+    def cancel(self, seq_id: int):
+        """Cancel an ordinary queued/running request at a serving step boundary."""
+        for queue in (self.waiting, self.running):
+            for seq in queue:
+                if seq.seq_id == seq_id:
+                    queue.remove(seq)
+                    self.block_manager.deallocate(seq)
+                    seq.status = SequenceStatus.FINISHED
+                    return seq
+        return None
+
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
         num_batched_tokens = 0
 
         # prefill
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
+        while (self.waiting and len(scheduled_seqs) < self.max_num_seqs
+               and len(self.running) < self.max_num_seqs):
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:

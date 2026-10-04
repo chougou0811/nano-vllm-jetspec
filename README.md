@@ -269,6 +269,158 @@ an unlocalized known anomaly. These findings unblock subsequent scheduler
 work under the stated contract; no Continuous Batching functionality is
 implemented in this numerical qualification.
 
+## JetSpec Phase 3.2: Continuous Batching
+
+`LLM.configure_jetspec()` routes the normal engine `add_request`, `step`,
+`is_finished` and `cancel_request` API through `JetSpecScheduler`. This is
+nano-vLLM's synchronous serving event loop: clients may submit or cancel
+between steps, with token deltas observable at step-return boundaries. It
+is not an HTTP server, background ingress thread, or concurrent GPU executor.
+
+```python
+from nanovllm import LLM, SamplingParams
+
+llm = LLM(target_model, enforce_eager=True, tensor_parallel_size=1,
+          max_num_seqs=8, max_num_batched_tokens=4096)
+llm.configure_jetspec(draft_model, max_tree_budget=63)
+a = llm.add_request("First prompt", SamplingParams(temperature=0, max_tokens=128),
+                    request_id="a", tree_budget=63)
+llm.step()
+for event in llm.last_step_info["events"]:
+    print(event["request_id"], event["kind"], event["token_ids"])
+b = llm.add_request("Later prompt", SamplingParams(temperature=0, max_tokens=64),
+                    request_id="b", tree_budget=31)
+while not llm.is_finished():
+    completed, num_tokens = llm.step()  # Negative emitted-token count in JetSpec mode.
+    for event in llm.last_step_info["events"]:
+        # kind=tokens: incremental token_ids; terminal kinds: full token_ids.
+        print(event["request_id"], event["kind"], event["token_ids"])
+# cancel_request(id) also works for queued, resident and suspended requests.
+llm.disable_jetspec()  # Requires all requests AND terminal events to be drained.
+```
+
+The adapter owns host tickets, FIFO waiting admission, a round-robin resident
+queue, and emitted-output cursors. The Phase 3.1 runtime continues to own
+canonical KV, per-request Draft caches, `BatchTreeTransaction` and the shared
+scratch arena. Every decode step builds one new ragged packed batch from the
+selected residents, runs one Target verification, then independently accepts
+and commits each request. Completed/cancelled tickets leave the queues; no
+unbounded completed-request archive is retained.
+
+Admission performs bounded, sequential dense prefill or recompute (default
+two admissions per step) and leaves room for an existing resident to decode.
+Prefill has a separate nonchunked token-work budget; batched/chunked prefill
+and batched Draft are not implemented. The packed-query budget is distributed
+fairly across eligible requests up to their individual tree caps; the final
+remaining output uses a root-only tree without a Draft call.
+
+For cached lengths `P_i`, effective node budgets `T_i`, remaining output caps
+`R_i`, page size `B`, and scratch high-water pages `S`, the conservative new
+page requirement is:
+
+```text
+destination growth = sum(ceil((P_i + min(T_i, 16, R_i)) / B) - owned_pages_i)
+scratch growth     = max(0, ceil(sum(T_i) / B) - S)
+required free      = destination growth + scratch growth
+```
+
+Here `16` is the currently supported trained head's `tree_depth + 1`.
+The read-only plan is followed by the existing atomic transaction admission;
+only the latter allocates pages. Under pressure the scheduler reduces tree
+budgets, selects a smaller fair batch, releases excess idle scratch if
+necessary, and finally preempts a lower-priority resident. Normal arrivals
+do not evict a progressing resident just to enter the batch.
+
+Preemption retains CPU committed tokens, the existing uncached anchor and
+already-emitted history, resets Draft state, then releases canonical KV.
+If Draft reset fails before release, the original resident still owns its KV.
+Resume prefills `committed[:-1]`, rebuilds KV/features and restores the same
+anchor: it neither generates a replacement anchor nor re-emits old outputs.
+Numerical changes from recomputation remain subject to the Phase 3.1 contract.
+Temporary external capacity shortage returns `blocked`/`blocked_reason` for
+the caller to back off and retry; an intrinsically unfit singleton produces
+an explicit terminal capacity error instead of a preemption loop.
+
+EOS, `max_tokens` (including zero) and cancellation are request-local.
+An emitted cursor delivers each token once. A failed packed batch terminates
+its selected requests while preserving unscheduled/queued requests, and queues
+published progress and terminal errors before rethrowing; a postcommit failure
+is never treated as a rollback. `last_step_info` preserves the error report,
+and pending notifications remain available on the next step or explicit drain.
+Cancel's immediate response confirms the terminal event subsequently delivered
+in the stream; consumers should not count both as two generated completions.
+The blocking `generate()` convenience API requires an initially idle queue. It
+raises on error/cancelled terminals or capacity backpressure, cancels its own
+requests, drains their notifications and retains the original error report;
+use the incremental `step()` loop when external capacity may become available.
+
+Ordinary, explicit packed and Continuous Batching modes are mutually exclusive.
+`disable_jetspec()` returns idle scratch pages while retaining immutable Draft
+weights. The ordinary scheduler now also respects already-running requests
+when admitting new prefills, so configured concurrency limits apply to both
+benchmark modes. This stage remains greedy, eager TP=1; prefix sharing,
+asynchronous execution, TP and CUDA graphs remain future work.
+
+Qualification and matched serving benchmark:
+
+```bash
+RUN_JETSPEC_PACKED_GPU_TESTS=1 python -m unittest discover -s tests -v
+PYTHONFAULTHANDLER=1 python benchmarks/jetspec_phase32.py --repo "$PWD" \
+  --output /tmp/jetspec-phase32.json --concurrencies 1,2,4,8 \
+  --max-tokens 128 --warmup 1 --repeats 3
+```
+
+The benchmark keeps one Target + Draft resident in both modes, uses identical
+offered wall-clock arrivals with mixed prompts/tree budgets/output caps, and
+records actual between-step submission and delivery times. Fixed-step
+replay, EOS/cancel, finite same-shape isolation, poisoned scratch, all-layer
+raw copies/history, held-page backpressure and real preemption/resume are
+separate correctness runs. Stage profiling is also separate from throughput
+samples. Cross-shape ordinary/JetSpec token differences are reported, not
+promoted into a new strict-bitwise gate.
+
+Measured on RTX 5090, Qwen3-8B BF16, eager TP=1 (one warmup and three
+repeats per mode/case). The two waves generate 256/337/674/1348 actual tokens
+for c1/c2/c4/c8, with mixed per-request caps 128/128/17/64:
+
+| Max residents | Ordinary tok/s | JetSpec tok/s | Ratio | Offered E2E p50, ordinary / JetSpec | Peak allocated KV slots, ordinary / JetSpec |
+|---|---:|---:|---:|---:|---:|
+| 1 | 24.38 | 92.00 | 3.77x | 7.869 / 2.177 s | 256 / 512 |
+| 2 | 33.45 | 119.51 | 3.57x | 7.746 / 2.114 s | 512 / 768 |
+| 4 | 46.22 | 175.81 | 3.80x | 11.133 / 2.715 s | 1024 / 1280 |
+| 8 | 55.27 | 203.20 | 3.68x | 16.495 / 4.472 s | 2048 / 2560 |
+
+The fixed pool is the same 249 pages / 63744 slots in both modes; these
+occupancy peaks are not smaller overall GPU pool allocations. Shared scratch
+high-water is 1/1/1/2 pages, not one scratch arena per request. At c8 the
+mean effective emission is 3.73 tokens per verified request, with mean raw
+accepted Draft length 2.78. Finite same-shape c8 Q408 isolation, poisoned
+scratch/raw-copy/history checks and real three-page preemption/replay pass;
+all 204 requests in the 29 audited timed/qualification runs have exactly one
+terminal event. Disable returns allocator occupancy to zero.
+
+Separate profiling points to Target/GEMM, serial per-request Draft, small
+kernel launch and host synchronization as optimization priorities. In the
+stage-profile workload Target verify takes 0.992 s of stream elapsed, Draft
+0.727 s, and accepted KV copy only 0.0036 s; these include host launch gaps
+and are nested, not additive GPU busy-time percentages. Actual CUDA traces
+show BF16 GEMMs as the leading kernels rather than accepted KV copy or packed
+attention alone. Batched Draft, fewer host synchronizations and bounded
+batched/chunked prefill are the next candidates, not implemented in this phase.
+
+See [the qualification record](benchmarks/phase32_qualification.json) for
+both latency clocks, per-case acceptance/capacity, source fingerprints,
+final-code follow-up and clean-checkout test results. The formal timed runs
+precede only a convenience-`generate()` error-handling correction; the
+incremental serving/packed execution paths are unchanged, and final code
+receives a separate c8/public-API qualification.
+The final-code c8 follow-up measures 3.73x and its real-model blocking API
+checks pass 9/9. A clean exact-code checkout passes all 130 tests (0 skips),
+including GPU packed-attention tests; the new continuous module passes 47/47.
+The user's pre-existing uncommitted legacy `runtime.py` remains untouched and
+outside this commit: four legacy abnormal-cleanup subtests still fail only
+with that retained dirty file, which the new serving runtime never calls.
+
 
 ## Star History
 

@@ -1,6 +1,6 @@
 """Eager packed JetSpec steps with per-request state and runner-owned scratch.
 
-This is a serving step boundary, not a Continuous Batching scheduler. Requests
+This is the execution boundary used by the Continuous Batching scheduler. Requests
 can be added, stepped in an arbitrary order, finished or cancelled between
 steps. Target verification is one real packed forward; Draft proposals remain
 per-request and share only immutable head weights.
@@ -38,6 +38,7 @@ class JetSpecRequest:
     cancelled: bool = False
     rounds: list[dict] = field(default_factory=list)
     result: dict | None = None
+    preemptions: int = 0
 
 
 class JetSpecBatchRuntime:
@@ -158,6 +159,109 @@ class JetSpecBatchRuntime:
                 "allocator_used_blocks": len(self.block_manager.used_block_ids),
                 "amplification": reserved / live if live else None}
 
+    def estimate_prefill_capacity(self, num_cached_tokens: int, tree_budget: int,
+                                  remaining_outputs: int) -> dict:
+        """Read-only admission upper bound, including one decode's workspace.
+
+        Recompute uses the saved committed prefix length, not original prompt
+        length. The final admission is still the transaction's atomic reserve.
+        """
+        self._check_idle()
+        if num_cached_tokens < 1 or not 1 <= tree_budget <= self.max_tree_budget or remaining_outputs < 0:
+            raise ValueError("invalid prefill capacity estimate")
+        b = self.block_size
+        canonical = (num_cached_tokens + b - 1) // b
+        path = min(tree_budget, self.tree_depth + 1, remaining_outputs)
+        destination = (num_cached_tokens + path + b - 1) // b - canonical
+        scratch = max(0, (tree_budget + b - 1) // b - len(self.arena.blocks)) if path else 0
+        needed = canonical + destination + scratch
+        return {"canonical_blocks": canonical, "destination_blocks": destination,
+                "scratch_growth_blocks": scratch, "required_free_blocks": needed,
+                "feasible": needed <= len(self.block_manager.free_block_ids)}
+
+    def estimate_step_capacity(self, requests, tree_budgets=None) -> dict:
+        """Conservative host plan; no pages/slots are reserved here."""
+        self._check_idle()
+        selected = self._selected(requests)
+        budgets = self._step_budgets(selected, tree_budgets)
+        b = self.block_size
+        destinations = []
+        for request, budget in zip(selected, budgets):
+            path = min(budget, self.tree_depth + 1, request.max_new_tokens - len(request.output_ids))
+            destinations.append((request.state.cache_len + path + b - 1) // b - len(request.state.owned_blocks))
+        total = sum(budgets)
+        scratch = max(0, (total + b - 1) // b - len(self.arena.blocks))
+        needed = sum(destinations) + scratch
+        return {"destination_blocks": sum(destinations), "destination_blocks_by_request": destinations,
+                "scratch_growth_blocks": scratch, "required_free_blocks": needed,
+                "total_query_tokens": total,
+                "feasible": total <= self.max_verify_tokens and needed <= len(self.block_manager.free_block_ids)}
+
+    def _step_budgets(self, selected, tree_budgets):
+        budgets = [r.tree_budget for r in selected] if tree_budgets is None else list(tree_budgets)
+        if len(budgets) != len(selected) or any(
+                isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= r.tree_budget
+                for r, n in zip(selected, budgets)):
+            raise ValueError("one positive effective tree budget, within its request cap, is required per request")
+        return budgets
+
+    @torch.inference_mode()
+    def suspend(self, request: JetSpecRequest) -> dict:
+        """Recompute preemption: retain CPU tokens/anchor, release canonical KV.
+
+        No output is generated and no runner-owned scratch is freed. The old
+        runtime request is invalid after suspension; the scheduler owns its CPU
+        snapshot until resume or cancellation.
+        """
+        self._check_idle()
+        if self.requests.get(request.request_id) is not request or request.finished or request.cancelled:
+            raise ValueError("only a live unfinished request can be suspended")
+        request.state.assert_round_invariant()
+        snapshot = {"request_id": request.request_id,
+                    "committed_tokens": request.state.committed[0].tolist(),
+                    "output_ids": list(request.output_ids), "tree_budget": request.tree_budget,
+                    "max_new_tokens": request.max_new_tokens, "ignore_eos": request.ignore_eos,
+                    "prompt_length": request.prompt_length, "created_at": request.created_at,
+                    "rounds": list(request.rounds), "preemptions": request.preemptions + 1,
+                    "state_invariant": {"kv_length": request.state.cache_len,
+                        "feature_length": int(request.state.target_hidden.shape[1]),
+                        "committed_minus_one": int(request.state.committed.shape[1]) - 1}}
+        request.drafter.reset_cache()
+        request.state.clear()
+        del self.requests[request.request_id]
+        return snapshot
+
+    @torch.inference_mode()
+    def resume(self, snapshot: dict) -> JetSpecRequest:
+        """Rebuild historical KV/features without replacing/emitting the anchor."""
+        self._check_idle()
+        request_id = snapshot["request_id"]
+        if request_id in self.requests:
+            raise ValueError("request ID is already live")
+        ids = self._prompt_ids(snapshot["committed_tokens"])
+        prefix = ids[0, :-1]
+        if prefix.numel() < 1 or len(snapshot["output_ids"]) >= snapshot["max_new_tokens"]:
+            raise ValueError("invalid suspended request")
+        reset_context()
+        _, prompt_kv, taps = self.target.model.forward_dense(
+            prefix, torch.arange(prefix.numel(), device=ids.device), None, None, self.target_layer_ids,
+        )
+        state = None
+        try:
+            state = PagedTargetState.from_prefill(ids, prompt_kv, taps.unsqueeze(0),
+                self.kv_pool, self.block_manager, self.block_size)
+            request = JetSpecRequest(request_id, state, self._new_drafter(),
+                snapshot["tree_budget"], snapshot["max_new_tokens"], snapshot["ignore_eos"],
+                snapshot["prompt_length"], list(snapshot["output_ids"]), snapshot["created_at"],
+                rounds=list(snapshot["rounds"]), preemptions=snapshot["preemptions"])
+            state.assert_round_invariant()
+            self.requests[request_id] = request
+            return request
+        except BaseException:
+            if state is not None:
+                state.clear()
+            raise
+
     def _selected(self, requests=None) -> list[JetSpecRequest]:
         selected = list(self.requests.values()) if requests is None else list(requests)
         if len({id(r) for r in selected}) != len(selected):
@@ -177,7 +281,7 @@ class JetSpecBatchRuntime:
         return self.target.lm_head(hidden), taps
 
     @torch.inference_mode()
-    def step(self, requests=None) -> dict[str, Any]:
+    def step(self, requests=None, *, tree_budgets=None) -> dict[str, Any]:
         """One packed verify/commit with a single publication boundary.
 
         Failures before commit preserve every prefix. After physical commit,
@@ -186,9 +290,10 @@ class JetSpecBatchRuntime:
         """
         self._check_idle()
         selected = self._selected(requests)
+        budgets = self._step_budgets(selected, tree_budgets)
         if not selected:
             return {"request_ids": [], "total_query_tokens": 0, "capacity": self.capacity_snapshot()}
-        if sum(r.tree_budget for r in selected) > self.max_verify_tokens:
+        if sum(budgets) > self.max_verify_tokens:
             raise ValueError("batch exceeds the packed verification token budget")
         from jetspec.tree import build_ancestor_matrix, gpu_tree_accept
         transaction = None
@@ -204,12 +309,22 @@ class JetSpecBatchRuntime:
 
         try:
             trees = []
-            for r in selected:
+            for r, budget in zip(selected, budgets):
                 r.state.assert_round_invariant()
+                if budget == 1 and not self._reference_mode:
+                    # Pressure/output-tail fallback: genuine root verification,
+                    # same packed attention/accept/commit, no useless Draft call.
+                    trees.append(SimpleNamespace(
+                        token_ids=r.state.committed[0, -1:].clone(),
+                        depth=torch.zeros(1, dtype=torch.long, device=self.kv_pool.device),
+                        parent_indices=torch.full((1,), -1, dtype=torch.long, device=self.kv_pool.device),
+                        num_nodes=1, ancestor=torch.ones(1, 1, dtype=torch.bool, device=self.kv_pool.device),
+                    ))
+                    continue
                 if self._reference_mode:
                     # One genuine AR root and T-1 isolated dummy queries. This
                     # is an explicit numerical comparator, never a serving path.
-                    n = r.tree_budget
+                    n = budget
                     trees.append(SimpleNamespace(
                         token_ids=torch.cat((r.state.committed[0, -1:], torch.zeros(
                             n - 1, dtype=torch.long, device=self.kv_pool.device))),
@@ -223,11 +338,12 @@ class JetSpecBatchRuntime:
                 )
                 trees.append(self.tree_algorithm.build(
                     int(r.state.committed[0, -1]), draft_logits,
-                    self.tree_depth + 1, self.tree_width, r.tree_budget, self.kv_pool.device,
+                    self.tree_depth + 1, self.tree_width, budget, self.kv_pool.device,
                 ))
             transaction = BatchTreeTransaction.admit(
                 [r.state for r in selected], [int(t.num_nodes) for t in trees],
-                [min(int(t.num_nodes), self.tree_depth + 1) for t in trees], self.arena,
+                [min(int(t.num_nodes), self.tree_depth + 1, r.max_new_tokens - len(r.output_ids))
+                 for r, t in zip(selected, trees)], self.arena,
             )
             self._active_transaction = transaction
             metadata = PackedTreeMetadata.build(
@@ -271,6 +387,7 @@ class JetSpecBatchRuntime:
                 features.append(taps[lo:hi].unsqueeze(0))
                 record = {
                     "request_id": r.request_id, "tree_size": int(tree.num_nodes),
+                    "effective_tree_budget": budgets[i],
                     "accepted_draft_length": int(accepted_len),
                     "committed_path_indices": [int(x) for x in path.tolist()],
                     "raw_accepted_path_indices": [int(x) for x in raw_path.tolist()],
@@ -328,15 +445,19 @@ class JetSpecBatchRuntime:
         invariant = {"kv_length": request.state.cache_len,
                      "feature_length": int(request.state.target_hidden.shape[1]),
                      "committed_minus_one": int(request.state.committed.shape[1]) - 1}
+        # Prepare all fallible result construction before releasing ownership.
+        result = {"request_id": request.request_id, "token_ids": list(request.output_ids),
+                  "text": self.tokenizer.decode(request.output_ids, skip_special_tokens=True),
+                  "tree_budget": request.tree_budget, "rounds": list(request.rounds),
+                  "cancelled": request.cancelled, "state_invariant": invariant,
+                  "preemptions": request.preemptions,
+                  "latency_s": time.perf_counter() - request.created_at}
         released = request.state.clear()
-        request.drafter.reset_cache()
         del self.requests[request.request_id]
-        request.result = {"request_id": request.request_id, "token_ids": list(request.output_ids),
-                          "text": self.tokenizer.decode(request.output_ids, skip_special_tokens=True),
-                          "tree_budget": request.tree_budget, "rounds": list(request.rounds),
-                          "cancelled": request.cancelled, "state_invariant": invariant,
-                          "blocks_released": released,
-                          "latency_s": time.perf_counter() - request.created_at}
+        result["blocks_released"] = released
+        request.result = result
+        # Failure here must not put a cleared state back into the live registry.
+        request.drafter.reset_cache()
         return request.result
 
     def cancel(self, request: JetSpecRequest) -> dict:

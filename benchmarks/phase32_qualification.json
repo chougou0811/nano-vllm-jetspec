@@ -1,0 +1,717 @@
+{
+  "schema_version": 1,
+  "phase": "3.2 Continuous Batching",
+  "status": "QUALIFIED and frozen under inherited Phase 3.1 correctness/numerical contract",
+  "base_revision": "b82c96da05ce77d3d7a9deac8cec540b673306f7",
+  "implementation": {
+    "scheduler": "nanovllm/engine/jetspec_scheduler.py",
+    "public_api": [
+      "configure_jetspec",
+      "add_request",
+      "step",
+      "cancel_request",
+      "is_finished",
+      "disable_jetspec"
+    ],
+    "ownership": "host scheduler tickets/queues/cursors; reused runner canonical KV, request Draft caches, shared arena, atomic batch transaction",
+    "concurrency": "synchronous between-step arrivals; one packed Target verification per decode; no HTTP/background ingress or concurrent GPU executor",
+    "pressure": "fair Q waterfill, reduce budgets/subset, release excess idle scratch, recompute preemption; temporary external shortage is retryable step backpressure",
+    "blocking_generate": "initially idle queue, input order preserved, errors/cancel/backpressure raise and clean only owned tickets"
+  },
+  "scope": {
+    "greedy": true,
+    "eager": true,
+    "tensor_parallel_size": 1,
+    "batched_draft": false,
+    "batched_or_chunked_prefill": false,
+    "prefix_sharing": false,
+    "asynchronous_execution": false,
+    "cuda_graphs": false
+  },
+  "numerical_contract": {
+    "inherited": "benchmarks/phase31_numerical_qualification.json",
+    "required": [
+      "same-state same-shape deterministic replay",
+      "finite same-shape request/branch isolation",
+      "correct depth/visibility/physical slots",
+      "all-layer accepted-only byte-exact copy",
+      "history unchanged/rejected scratch excluded",
+      "independent EOS/output caps and exact-once stream",
+      "transaction ownership, cleanup and no leak"
+    ],
+    "cross_shape_layout_schedule_token_bitwise_equivalence_required": false,
+    "recompute_note": "resume preserves CPU token history and the uncached anchor; rebuilt BF16 KV/features may drift across execution shapes under inherited contract"
+  },
+  "environment": {
+    "torch": "2.8.0+cu128",
+    "cuda": "12.8",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "dtype": "bfloat16",
+    "target": "/root/autodl-tmp/models/modelscope-Qwen3-8B",
+    "draft": "/root/autodl-tmp/models/jetspec-qwen3-8b-020a198caefde24a2891ad827cba7fb977ccdc36"
+  },
+  "config": {
+    "tensor_parallel_size": 1,
+    "enforce_eager": true,
+    "gpu_memory_utilization": 0.8,
+    "max_num_batched_tokens": 4096,
+    "max_model_len": 4096,
+    "max_num_seqs": 8,
+    "kvcache_block_size": 256,
+    "warmup": 1,
+    "repeats": 3,
+    "max_tokens": 128,
+    "arrival_interval_ms": 20,
+    "temperature": 0
+  },
+  "global_pool": {
+    "blocks": 249,
+    "slots": 63744,
+    "bytes": 9399435264
+  },
+  "workload": {
+    "max_residents": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "requests_per_run": "2 * concurrency",
+    "first_wave": "concurrency requests at offered time zero",
+    "second_wave_interval_ms": 20,
+    "prompt_ids": [
+      "natural_language",
+      "math_logic",
+      "long_prompt",
+      "long_continuation"
+    ],
+    "tree_budgets": [
+      63,
+      31,
+      47,
+      63
+    ],
+    "output_caps": [
+      128,
+      128,
+      17,
+      64
+    ],
+    "timed_ignore_eos": true,
+    "warmup_per_mode_case": 1,
+    "measured_repeats_per_mode_case": 3,
+    "timed_samples": 24,
+    "baseline": "same eager Target + immutable Draft weights resident, same fixed KV pool; initialization excluded",
+    "latency": "offered clock includes delayed between-step submission; submitted clock is also recorded; tokens observable at step return",
+    "profiling_in_timing": false
+  },
+  "gates": {
+    "all_timed_requests_finished": true,
+    "dynamic_live_arrival_all_samples": true,
+    "qualification_passed": true,
+    "source_unchanged_during_formal_run": true,
+    "allocator_clean_after_disable": true,
+    "fixed_step_schedule_and_tokens_exact": true,
+    "eos_finished_before_cap": true,
+    "queued_cancel_has_no_tokens": true,
+    "running_cancel_had_tokens": true,
+    "held_page_backpressure_and_recovery": true,
+    "real_preemption_resume": true,
+    "real_c8_Q408_isolation": true,
+    "final_code_c8_and_public_generate_passed": true,
+    "clean_checkout_full_regression_passed": true
+  },
+  "qualification_counts": {
+    "real_fixed_step_lifecycle_requests_per_replay": 6,
+    "poison_replay_all_layer_raw_copy_checks": 13,
+    "poison_replay_history_and_rejected_checks": 18,
+    "c8_isolation_all_layer_raw_copy_checks": 12,
+    "c8_isolation_history_and_rejected_checks": 76,
+    "c8_finite_same_shape_perturbation_checks": 16,
+    "real_c8_first_node_counts": [
+      63,
+      31,
+      47,
+      63,
+      63,
+      31,
+      47,
+      63
+    ],
+    "real_c8_Q": 408,
+    "preemption_usable_pool_pages": 3,
+    "preemption_prompt_tokens": 250,
+    "preemption_replays": 2,
+    "exact_one_terminal_audit_runs": 29,
+    "exact_one_terminal_audit_requests": 204,
+    "exact_one_terminal_audit_passed": true
+  },
+  "performance": {
+    "c1": {
+      "actual_tokens_per_run": 256,
+      "throughput_ratio": 3.774375828957847,
+      "ordinary": {
+        "samples": 3,
+        "aggregate_tok_s_median": 24.375412960708864,
+        "ttft_s": {
+          "count": 6,
+          "p50": 2.642884025350213,
+          "p95": 5.250846748240292
+        },
+        "e2e_latency_s": {
+          "count": 6,
+          "p50": 7.858404034748673,
+          "p95": 10.478919229470193
+        },
+        "offered_ttft_s": {
+          "count": 6,
+          "p50": 2.654652278646827,
+          "p95": 5.273566534295679
+        },
+        "offered_e2e_latency_s": {
+          "count": 6,
+          "p50": 7.8693247248977425,
+          "p95": 10.502064248099924
+        },
+        "arrival_submission_lag_s": {
+          "count": 6,
+          "p50": 0.010756768062710762,
+          "p95": 0.023404296040534973
+        },
+        "peak_allocator_reserved_kv_slots": 256,
+        "dynamic_live_arrival_all_runs": true
+      },
+      "jetspec": {
+        "samples": 3,
+        "aggregate_tok_s_median": 92.00196949976537,
+        "ttft_s": {
+          "count": 6,
+          "p50": 0.8314594253897667,
+          "p95": 1.591003448702395
+        },
+        "e2e_latency_s": {
+          "count": 6,
+          "p50": 2.1472872104495764,
+          "p95": 2.707810773514211
+        },
+        "offered_ttft_s": {
+          "count": 6,
+          "p50": 0.8609876369684935,
+          "p95": 1.647657227255404
+        },
+        "offered_e2e_latency_s": {
+          "count": 6,
+          "p50": 2.1768117153644564,
+          "p95": 2.763070015721023
+        },
+        "arrival_submission_lag_s": {
+          "count": 6,
+          "p50": 0.026900991573929785,
+          "p95": 0.05878062780946493
+        },
+        "peak_allocator_reserved_kv_slots": 512,
+        "dynamic_live_arrival_all_runs": true,
+        "mean_raw_accepted_draft_tokens": 3.2131147540983607,
+        "mean_effective_output_per_verified_request": 4.163934426229508,
+        "max_packed_requests": 1,
+        "max_shared_scratch_pages": 1
+      },
+      "cross_schedule_tokens": {
+        "checked": 6,
+        "unequal": 6,
+        "is_gate": false
+      }
+    },
+    "c2": {
+      "actual_tokens_per_run": 337,
+      "throughput_ratio": 3.5729043014569286,
+      "ordinary": {
+        "samples": 3,
+        "aggregate_tok_s_median": 33.447926544080595,
+        "ttft_s": {
+          "count": 12,
+          "p50": 3.6247461158782244,
+          "p95": 7.354176833666861
+        },
+        "e2e_latency_s": {
+          "count": 12,
+          "p50": 7.731730191037059,
+          "p95": 10.082780681177974
+        },
+        "offered_ttft_s": {
+          "count": 12,
+          "p50": 3.6285584881156683,
+          "p95": 7.371150802314282
+        },
+        "offered_e2e_latency_s": {
+          "count": 12,
+          "p50": 7.745537025630474,
+          "p95": 10.09069741241634
+        },
+        "arrival_submission_lag_s": {
+          "count": 12,
+          "p50": 0.0038215159624814983,
+          "p95": 0.02790572766214609
+        },
+        "peak_allocator_reserved_kv_slots": 512,
+        "dynamic_live_arrival_all_runs": true
+      },
+      "jetspec": {
+        "samples": 3,
+        "aggregate_tok_s_median": 119.50624062416094,
+        "ttft_s": {
+          "count": 12,
+          "p50": 0.7365887593477964,
+          "p95": 1.659042189642787
+        },
+        "e2e_latency_s": {
+          "count": 12,
+          "p50": 2.065996313467622,
+          "p95": 2.7167167980223894
+        },
+        "offered_ttft_s": {
+          "count": 12,
+          "p50": 0.7819396460056305,
+          "p95": 1.732176993265748
+        },
+        "offered_e2e_latency_s": {
+          "count": 12,
+          "p50": 2.1140118555724623,
+          "p95": 2.790124931409955
+        },
+        "arrival_submission_lag_s": {
+          "count": 12,
+          "p50": 0.035147448554635044,
+          "p95": 0.09306224837899207
+        },
+        "peak_allocator_reserved_kv_slots": 768,
+        "dynamic_live_arrival_all_runs": true,
+        "mean_raw_accepted_draft_tokens": 2.489795918367347,
+        "mean_effective_output_per_verified_request": 3.3979591836734695,
+        "max_packed_requests": 2,
+        "max_shared_scratch_pages": 1
+      },
+      "cross_schedule_tokens": {
+        "checked": 12,
+        "unequal": 6,
+        "is_gate": false
+      }
+    },
+    "c4": {
+      "actual_tokens_per_run": 674,
+      "throughput_ratio": 3.803758100050964,
+      "ordinary": {
+        "samples": 3,
+        "aggregate_tok_s_median": 46.218968805422165,
+        "ttft_s": {
+          "count": 24,
+          "p50": 0.6994092483073473,
+          "p95": 10.524793553166091
+        },
+        "e2e_latency_s": {
+          "count": 24,
+          "p50": 11.12616378441453,
+          "p95": 14.537104707397521
+        },
+        "offered_ttft_s": {
+          "count": 24,
+          "p50": 0.725733151435852,
+          "p95": 10.593655005052685
+        },
+        "offered_e2e_latency_s": {
+          "count": 24,
+          "p50": 11.132502514198421,
+          "p95": 14.60895864071697
+        },
+        "arrival_submission_lag_s": {
+          "count": 24,
+          "p50": 0.006351794376969339,
+          "p95": 0.0760301374644041
+        },
+        "peak_allocator_reserved_kv_slots": 1024,
+        "dynamic_live_arrival_all_runs": true
+      },
+      "jetspec": {
+        "samples": 3,
+        "aggregate_tok_s_median": 175.8057769696274,
+        "ttft_s": {
+          "count": 24,
+          "p50": 0.38177757523953915,
+          "p95": 2.4336651898920536
+        },
+        "e2e_latency_s": {
+          "count": 24,
+          "p50": 2.6432660929858685,
+          "p95": 3.7178066432476045
+        },
+        "offered_ttft_s": {
+          "count": 24,
+          "p50": 0.42782147392630576,
+          "p95": 2.4651834162697197
+        },
+        "offered_e2e_latency_s": {
+          "count": 24,
+          "p50": 2.7148173256218433,
+          "p95": 3.74932486962527
+        },
+        "arrival_submission_lag_s": {
+          "count": 24,
+          "p50": 0.015587371811270713,
+          "p95": 0.09129963640123605
+        },
+        "peak_allocator_reserved_kv_slots": 1280,
+        "dynamic_live_arrival_all_runs": true,
+        "mean_raw_accepted_draft_tokens": 2.6885245901639343,
+        "mean_effective_output_per_verified_request": 3.639344262295082,
+        "max_packed_requests": 4,
+        "max_shared_scratch_pages": 1
+      },
+      "cross_schedule_tokens": {
+        "checked": 24,
+        "unequal": 12,
+        "is_gate": false
+      }
+    },
+    "c8": {
+      "actual_tokens_per_run": 1348,
+      "throughput_ratio": 3.6766124180201625,
+      "ordinary": {
+        "samples": 3,
+        "aggregate_tok_s_median": 55.26913557656775,
+        "ttft_s": {
+          "count": 48,
+          "p50": 1.1145638935267925,
+          "p95": 16.308833246678113
+        },
+        "e2e_latency_s": {
+          "count": 48,
+          "p50": 16.494799418374896,
+          "p95": 23.3942641666159
+        },
+        "offered_ttft_s": {
+          "count": 48,
+          "p50": 1.1543064615875482,
+          "p95": 16.39475905510783
+        },
+        "offered_e2e_latency_s": {
+          "count": 48,
+          "p50": 16.49485708400607,
+          "p95": 23.48493546143919
+        },
+        "arrival_submission_lag_s": {
+          "count": 48,
+          "p50": 0.0009986409544944785,
+          "p95": 0.1089177381619811
+        },
+        "peak_allocator_reserved_kv_slots": 2048,
+        "dynamic_live_arrival_all_runs": true
+      },
+      "jetspec": {
+        "samples": 3,
+        "aggregate_tok_s_median": 203.20319019404894,
+        "ttft_s": {
+          "count": 48,
+          "p50": 0.7387447152286768,
+          "p95": 4.149349157698452
+        },
+        "e2e_latency_s": {
+          "count": 48,
+          "p50": 4.382436977699399,
+          "p95": 6.370317446440458
+        },
+        "offered_ttft_s": {
+          "count": 48,
+          "p50": 0.7845227157324552,
+          "p95": 4.248545953534543
+        },
+        "offered_e2e_latency_s": {
+          "count": 48,
+          "p50": 4.472228094786406,
+          "p95": 6.42244847047329
+        },
+        "arrival_submission_lag_s": {
+          "count": 48,
+          "p50": 0.005817026644945142,
+          "p95": 0.11836899663507935
+        },
+        "peak_allocator_reserved_kv_slots": 2560,
+        "dynamic_live_arrival_all_runs": true,
+        "mean_raw_accepted_draft_tokens": 2.7815126050420167,
+        "mean_effective_output_per_verified_request": 3.73109243697479,
+        "max_packed_requests": 8,
+        "max_shared_scratch_pages": 2
+      },
+      "cross_schedule_tokens": {
+        "checked": 48,
+        "unequal": 33,
+        "is_gate": false
+      }
+    }
+  },
+  "profile": {
+    "separate_stage_workload": "c8, two arrival waves, max cap32 with mixed caps",
+    "stage_calls_and_totals": {
+      "prefill_request": {
+        "calls": 16,
+        "host_wall_total_s": 0.46481215953826904,
+        "stream_elapsed_total_s": 0.4646059799194336
+      },
+      "draft": {
+        "calls": 112,
+        "host_wall_total_s": 0.6514493525028229,
+        "stream_elapsed_total_s": 0.7273485116958618
+      },
+      "tree_build": {
+        "calls": 112,
+        "host_wall_total_s": 0.05629556253552437,
+        "stream_elapsed_total_s": 0.05455280008912086
+      },
+      "reserve_transaction": {
+        "calls": 20,
+        "host_wall_total_s": 0.020083419978618622,
+        "stream_elapsed_total_s": 0.019839488089084624
+      },
+      "metadata_build": {
+        "calls": 20,
+        "host_wall_total_s": 0.019873231649398804,
+        "stream_elapsed_total_s": 0.019642272144556047
+      },
+      "target_verify": {
+        "calls": 20,
+        "host_wall_total_s": 0.6723401732742786,
+        "stream_elapsed_total_s": 0.9922338905334472
+      },
+      "acceptance": {
+        "calls": 118,
+        "host_wall_total_s": 0.38133297115564346,
+        "stream_elapsed_total_s": 0.07610182434436866
+      },
+      "accepted_kv_copy": {
+        "calls": 20,
+        "host_wall_total_s": 0.003982797265052795,
+        "stream_elapsed_total_s": 0.0035948800295591355
+      },
+      "commit_total": {
+        "calls": 20,
+        "host_wall_total_s": 0.027738191187381744,
+        "stream_elapsed_total_s": 0.027538687825202943
+      },
+      "engine_step_total": {
+        "calls": 20,
+        "host_wall_total_s": 2.46780863404274,
+        "stream_elapsed_total_s": 2.467566562652588
+      }
+    },
+    "stage_note": "stage stream elapsed includes host launch gaps; nested stages must not be added together",
+    "separate_kernel_workload": "c8 Q408, cap8; actual CPU/CUDA profiler events",
+    "top_cpu_ops": [
+      {
+        "operator": "cudaLaunchKernel",
+        "calls": 32620,
+        "self_cpu_ms": 137.000353999999,
+        "total_cpu_ms": 138.51034399999898
+      },
+      {
+        "operator": "aten::mm",
+        "calls": 3629,
+        "self_cpu_ms": 41.922673000000025,
+        "total_cpu_ms": 66.26520700000029
+      },
+      {
+        "operator": "cudaStreamSynchronize",
+        "calls": 574,
+        "self_cpu_ms": 39.33455600000017,
+        "total_cpu_ms": 39.33455600000017
+      },
+      {
+        "operator": "aten::mul",
+        "calls": 8131,
+        "self_cpu_ms": 38.10963400000027,
+        "total_cpu_ms": 71.53867499999899
+      },
+      {
+        "operator": "aten::add",
+        "calls": 4142,
+        "self_cpu_ms": 20.274952999997225,
+        "total_cpu_ms": 37.00068899999967
+      },
+      {
+        "operator": "aten::copy_",
+        "calls": 6006,
+        "self_cpu_ms": 18.037390999999804,
+        "total_cpu_ms": 71.22029000000155
+      },
+      {
+        "operator": "aten::empty_strided",
+        "calls": 5738,
+        "self_cpu_ms": 15.948981999995787,
+        "total_cpu_ms": 15.948981999995787
+      },
+      {
+        "operator": "cuLaunchKernel",
+        "calls": 3629,
+        "self_cpu_ms": 14.61628300000052,
+        "total_cpu_ms": 14.61628300000052
+      }
+    ],
+    "top_cuda_kernels": [
+      {
+        "kernel": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x256_32x4_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x256_32x4_tn_align8::Params)",
+        "calls": 434,
+        "device_ms": 84.9888200000004
+      },
+      {
+        "kernel": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x2_tn_align8>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x2_tn_align8::Params)",
+        "calls": 758,
+        "device_ms": 39.052129999998705
+      },
+      {
+        "kernel": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x128_32x4_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x128_32x4_tn_align8::Params)",
+        "calls": 432,
+        "device_ms": 34.6932799999998
+      },
+      {
+        "kernel": "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x2_tn_align8>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x2_tn_align8::Params)",
+        "calls": 1146,
+        "device_ms": 33.33206499999897
+      },
+      {
+        "kernel": "_packed_paged_tree_fp32",
+        "calls": 108,
+        "device_ms": 17.373552999999543
+      },
+      {
+        "kernel": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x256_32x3_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x256_32x3_tn_align8::Params)",
+        "calls": 72,
+        "device_ms": 17.29231199999962
+      },
+      {
+        "kernel": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x64_32x4_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x64_32x4_tn_align8::Params)",
+        "calls": 396,
+        "device_ms": 17.147000999999616
+      },
+      {
+        "kernel": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8::Params)",
+        "calls": 9,
+        "device_ms": 12.108219999999987
+      }
+    ],
+    "conclusion": "Prioritize Target/GEMM, per-request Draft, small-op launch and host synchronization. Accepted KV copy is small; no evidence that packed attention alone is the dominant bottleneck."
+  },
+  "provenance": {
+    "formal_run_production_source_sha256": "6e37f8b7072d726da7a5ada4b2f0ea9956ea3a43c8f13d8d9185e0e4d0566860",
+    "formal_run_production_file_sha256": {
+      "nanovllm/engine/llm_engine.py": "b8437f87f54fa854709447defd3468d37c6857e9dbeab8651d6e3b4a21169530",
+      "nanovllm/engine/jetspec_scheduler.py": "4b0e5f26715d6af4491a1d65e230dd729018225a31ce46cb4d2a5186fe3a5d98",
+      "nanovllm/engine/scheduler.py": "b9db140bc41eb798a5b2338337db71adf8ffdc72dfade6599a7d05af2d02c0e1",
+      "nanovllm/speculative/jetspec/batch_runtime.py": "1bde90ec896050b17dbfae8746db3b6b73ae81bc099cd700c1f60229914abad3",
+      "nanovllm/speculative/jetspec/state.py": "4e2801d792774d5d2ab6e128f98f3338349b53cd0abc81f317b170753405717e",
+      "nanovllm/speculative/jetspec/packed_metadata.py": "382582236a9f32037139c324d9d29f803a32239ebf26466f8c4d84b9dd599f11",
+      "nanovllm/speculative/jetspec/paged_backend.py": "fe62c92aaa5137f4c14cc3c73d07e3af20931dc53545481c78fda01f47262ab8",
+      "nanovllm/models/qwen3.py": "0c0ae9af25cefb1463743f833b6eec4f19a11dda7be26cafb635e69352a86559",
+      "nanovllm/engine/block_manager.py": "5eb312b0f7a44f18abf5b367a56d12d4720236f8ccef75d34509bafa63a91754"
+    },
+    "benchmark_script_sha256": "c9d4fe3e05deab6ccf82af7955cad7c55009fec3b2f5a596728d5b9ecb725531",
+    "benchmark_helper_sha256": {
+      "jetspec_phase3.py": "777f76671896fd0cbaa048413b21c2eeac50a6fed66d8b2836e3b445ff3b9933",
+      "jetspec_phase31.py": "b0e8592351c115c818ef1057f322b7c94f614c9a30f50a2283f5a28e7abb3ca6"
+    },
+    "post_formal_change": "Only public generate convenience wrapper fixed; public add/step/cancel, scheduler, packed execution and numerical kernels unchanged. Final-code c8 and real generate smoke recorded separately.",
+    "preserved_user_legacy_runtime_git_blob": "32cab56bbeee4981ef346f446b7e2aedc0f8e106",
+    "legacy_runtime_not_called_by_new_serving": true,
+    "raw_formal_json": "/root/autodl-tmp/benchmarks/jetspec-phase32/final.json",
+    "raw_formal_json_sha256": "19dc8bc079e8ce9b9272164ab5417fca6408d9cbfeb0aacf3a83677c4d4da17a",
+    "raw_trace": "/root/autodl-tmp/benchmarks/jetspec-phase32/final.trace.json",
+    "raw_trace_sha256": "3ef198eafe5caddcac7fa306f34efa6addd9ce680f008e5ed9eb4ed8f12194d6",
+    "final_serving_file_sha256": {
+      "nanovllm/engine/llm_engine.py": "2d0158551c396e90e4f147819f5e10f3aae64c5475d6e9a798bbae7d3dcf410c",
+      "nanovllm/engine/jetspec_scheduler.py": "4b0e5f26715d6af4491a1d65e230dd729018225a31ce46cb4d2a5186fe3a5d98",
+      "nanovllm/engine/scheduler.py": "b9db140bc41eb798a5b2338337db71adf8ffdc72dfade6599a7d05af2d02c0e1",
+      "nanovllm/speculative/jetspec/batch_runtime.py": "1bde90ec896050b17dbfae8746db3b6b73ae81bc099cd700c1f60229914abad3",
+      "nanovllm/speculative/jetspec/state.py": "4e2801d792774d5d2ab6e128f98f3338349b53cd0abc81f317b170753405717e",
+      "nanovllm/speculative/jetspec/packed_metadata.py": "382582236a9f32037139c324d9d29f803a32239ebf26466f8c4d84b9dd599f11",
+      "nanovllm/speculative/jetspec/paged_backend.py": "fe62c92aaa5137f4c14cc3c73d07e3af20931dc53545481c78fda01f47262ab8",
+      "nanovllm/models/qwen3.py": "0c0ae9af25cefb1463743f833b6eec4f19a11dda7be26cafb635e69352a86559",
+      "nanovllm/engine/block_manager.py": "5eb312b0f7a44f18abf5b367a56d12d4720236f8ccef75d34509bafa63a91754"
+    },
+    "final_production_source_sha256": "cb7576b3c9ddd105d8811814ed7de19e213b38dd594d0c0624b66eb476711bf2",
+    "official_jetspec_revision": "2c7b3fae75690dfe9a188a37d7fdfd43ee0e032f",
+    "official_vllm_jetspec_revision": "f90d5ca17a2c05f436a80ee2e0984cc7a22e1a16"
+  },
+  "final_code_followup": {
+    "production_source_sha256": "cb7576b3c9ddd105d8811814ed7de19e213b38dd594d0c0624b66eb476711bf2",
+    "c8": {
+      "warmup": 1,
+      "repeats": 1,
+      "ordinary_tok_s": 53.14346480248174,
+      "jetspec_tok_s": 198.26395380788804,
+      "ratio": 3.730730665468943,
+      "all_requests_finished": true,
+      "dynamic_live_arrivals": true,
+      "source_unchanged": true,
+      "allocator_clean": true
+    },
+    "public_generate": {
+      "checks": {
+        "mixed_caps_and_input_order": true,
+        "zero_cap_empty": true,
+        "mixed_own_queue_idle": true,
+        "fail_fast_blocked_error": true,
+        "foreign_ownership_preserved": true,
+        "failed_own_queue_idle": true,
+        "failed_scratch_released": true,
+        "successful_recovery": true,
+        "allocator_zero_after_disable": true
+      },
+      "real_model_checks_passed": 9,
+      "held_pages": 249,
+      "blocked_reason": "JetSpec generation blocked: waiting_for_kv_admission; use add_request/step to retry external KV backpressure",
+      "blocked_call_wall_s": 0.00015787407755851746,
+      "source_unchanged": true,
+      "allocator_used_after": 0
+    },
+    "actual_worker_process": {
+      "actual_exit_code": 0,
+      "exit139_observed": false,
+      "shared_real_gpu_model": true,
+      "status_source": "exec session 74478 completion returned exit_code=0"
+    },
+    "artifacts": {
+      "/root/autodl-tmp/benchmarks/jetspec-phase32/postpatch-c8.json": "0767ce81cf51da728c61cf12e34533d30fa2faa640b4b3b4c47e6473e34268af",
+      "/root/autodl-tmp/benchmarks/jetspec-phase32/postpatch-generate.json": "20fba79ae20e51e15f417ccd93911cc5af7148412130c574cc65730804496660"
+    }
+  },
+  "regression": {
+    "clean_checkout": {
+      "tested_revision": "f2e5ba685eedd95997eadc460261d3b24ed7db56",
+      "path": "/root/autodl-tmp/phase32-clean-C9Ze3Y",
+      "command": "RUN_JETSPEC_PACKED_GPU_TESTS=1 /root/autodl-tmp/venvs/jetspec-phase0/bin/python -m unittest discover -s tests -v",
+      "actual_exit_code": 0,
+      "tests": 130,
+      "passed": 130,
+      "skipped": 0,
+      "failures": 0,
+      "errors": 0,
+      "unittest_elapsed_s": 3.272,
+      "imports_verified_from_clean_checkout": true,
+      "git_status_clean_before_and_after": true,
+      "final_manifest_serving_files_matched": 9,
+      "all_nonlegacy_production_python_files_matched": 27,
+      "legacy_user_dirty_runtime_excluded": true,
+      "log": "/root/autodl-tmp/benchmarks/jetspec-phase32/clean-unittest.log",
+      "log_sha256": "326244b542a1090eb92501945bfb37c2d46316580d53ed357272349e6dd90699",
+      "final_commit_note": "Final amend records only README/qualification evidence; all tested production, benchmark and test Python stays identical."
+    },
+    "user_worktree_note": "Preserved uncommitted legacy runtime.py changes deliberately excluded from commit; its legacy abnormal-cleanup test remains four failing subtests in dirty workspace, not on the new batch runtime path.",
+    "continuous_test_module": {
+      "cases": 47,
+      "passed": 47,
+      "mode": "CPU, real allocator/state/transactions; deterministic toy Target/Draft",
+      "file": "tests/test_jetspec_continuous.py"
+    }
+  },
+  "known_anomalies": {
+    "prior_exit_139": "Not observed in current real-model formal/smoke runs; prior Phase 3.1 known anomaly retained, not explained or silently removed."
+  },
+  "next_stage": "Phase 3.2 may freeze and enter focused performance optimization; not a claim of asynchronous production HTTP serving."
+}
