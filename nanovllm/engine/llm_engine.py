@@ -35,6 +35,9 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        batch_cached = getattr(self, "_jetspec_batch_runtime", None)
+        if batch_cached is not None:
+            batch_cached[1].close()
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
@@ -63,6 +66,12 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
+        batch_cached = getattr(self, "_jetspec_batch_runtime", None)
+        if batch_cached is not None:
+            if batch_cached[1].requests:
+                raise RuntimeError("ordinary generation cannot interleave live JetSpec batch requests")
+            if not batch_cached[1]._closed:
+                batch_cached[1].release_idle_scratch()
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
@@ -116,6 +125,9 @@ class LLMEngine:
             raise ValueError("tree_backend must be 'dense' or 'paged'")
         if self.scheduler.waiting or self.scheduler.running:
             raise RuntimeError("generate_jetspec requires an idle single-request scheduler")
+        batch_cached = getattr(self, "_jetspec_batch_runtime", None)
+        if batch_cached is not None and batch_cached[1].requests:
+            raise RuntimeError("legacy JetSpec cannot interleave live packed requests")
         from nanovllm.speculative.jetspec.runtime import JetSpecRuntime
 
         cache_key = (draft_model, int(tree_depth), int(tree_width), int(tree_budget))
@@ -143,3 +155,51 @@ class LLMEngine:
             record_tree_layout=record_tree_layout,
             return_rounds=return_rounds,
         )
+
+    def get_jetspec_batch_runtime(self, draft_model: str, *, tree_depth: int = 15,
+                                 tree_width: int = 7, max_tree_budget: int = 63):
+        """Get the idle-scheduler packed runner for explicit create/step/finish.
+
+        The runner owns scratch; each request owns its canonical state and Draft
+        cache. This opt-in API is not wired into the ordinary serving scheduler.
+        """
+        if self.model_runner.world_size != 1 or not self.model_runner.enforce_eager:
+            raise ValueError("packed JetSpec currently requires TP=1 and eager execution")
+        if self.scheduler.waiting or self.scheduler.running:
+            raise RuntimeError("packed JetSpec requires an idle ordinary scheduler")
+        from nanovllm.speculative.jetspec.batch_runtime import JetSpecBatchRuntime
+        key = (draft_model, int(tree_depth), int(tree_width), int(max_tree_budget))
+        cached = getattr(self, "_jetspec_batch_runtime", None)
+        if cached is not None and (cached[0] != key or cached[1]._closed):
+            if cached[1].requests:
+                raise RuntimeError("cannot replace a packed runner with live requests")
+            cached[1].close()
+            cached = None
+        if cached is None:
+            legacy = getattr(self, "_jetspec_runtime", None)
+            head = legacy[1].head if legacy is not None and legacy[0][0] == draft_model else None
+            config = self.model_runner.config
+            runtime = JetSpecBatchRuntime(
+                target=self.model_runner.model, tokenizer=self.tokenizer,
+                draft_model=draft_model, kv_pool=self.model_runner.kv_cache,
+                block_manager=self.scheduler.block_manager, block_size=self.model_runner.block_size,
+                tree_depth=tree_depth, tree_width=tree_width, max_tree_budget=max_tree_budget,
+                max_verify_tokens=config.max_num_batched_tokens, max_model_len=config.max_model_len,
+                head=head,
+            )
+            self._jetspec_batch_runtime = (key, runtime)
+        else:
+            runtime = cached[1]
+        return runtime
+
+    def generate_jetspec_batch(self, prompts, draft_model: str, *, max_tokens=32,
+                              tree_budgets=63, tree_depth: int = 15, tree_width: int = 7,
+                              ignore_eos: bool = False, return_rounds: bool = True) -> dict:
+        """Greedy eager packed ragged tree verification with shared scratch."""
+        runtime = self.get_jetspec_batch_runtime(
+            draft_model, tree_depth=tree_depth, tree_width=tree_width,
+            max_tree_budget=max(63, max(tree_budgets) if not isinstance(tree_budgets, int) else tree_budgets),
+        )
+        return runtime.generate_batch(prompts, max_new_tokens=max_tokens,
+                                      tree_budgets=tree_budgets, ignore_eos=ignore_eos,
+                                      return_rounds=return_rounds)

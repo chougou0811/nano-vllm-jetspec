@@ -190,9 +190,11 @@ class Qwen3Attention(nn.Module):
         k_pool: torch.Tensor,
         v_pool: torch.Tensor,
         node_slots: torch.Tensor,
-        logical_slots: torch.Tensor,
-        qq_bias: torch.Tensor,
+        logical_slots: torch.Tensor | None,
+        qq_bias: torch.Tensor | None,
         block_size: int,
+        *,
+        packed_metadata=None,
     ) -> torch.Tensor:
         """Reference-numeric QKV plus JetSpec-style paged tree attention."""
         weight = self.qkv_proj.weight
@@ -223,6 +225,21 @@ class Qwen3Attention(nn.Module):
             return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
 
         q, k = apply_hf_rope(q), apply_hf_rope(k)
+        if packed_metadata is not None:
+            # Packed batches use the allocator's actual page geometry. Prefix
+            # pages and tree scratch are different regions of this same pool;
+            # the kernel receives only canonical tables + this round's slots.
+            blocks = torch.div(node_slots, block_size, rounding_mode="floor").long()
+            offsets = torch.remainder(node_slots, block_size).long()
+            k_pool[blocks, offsets] = k
+            v_pool[blocks, offsets] = v
+            from nanovllm.speculative.jetspec.paged_backend import packed_tree_attention
+
+            out = packed_tree_attention(
+                q, k_pool, v_pool, packed_metadata, self.scaling,
+                self.num_heads // self.num_kv_heads,
+            )
+            return self.o_proj(out.flatten(1, -1))
         # The nano pool allocates 256-token blocks.  Present the same underlying
         # storage as 16-token sub-pages to the official JetSpec kernel, matching
         # its validated Qwen3 launch contract without copying any K/V bytes.
@@ -260,6 +277,21 @@ class Qwen3Attention(nn.Module):
             lens,
         )
         return self.o_proj(out.flatten(1, -1))
+
+    def forward_packed_tree(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        k_pool: torch.Tensor,
+        v_pool: torch.Tensor,
+        metadata,
+    ) -> torch.Tensor:
+        """One QKV/GEMM and FP32 ragged attention launch for all request nodes."""
+        return self.forward_paged_tree(
+            positions, hidden_states, k_pool, v_pool,
+            metadata.tree_slots, None, None, metadata.block_size,
+            packed_metadata=metadata,
+        )
 
 
 class Qwen3MLP(nn.Module):
@@ -394,6 +426,26 @@ class Qwen3DecoderLayer(nn.Module):
         )
         return residual + hidden_states
 
+    def forward_packed_tree(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        k_pool: torch.Tensor,
+        v_pool: torch.Tensor,
+        metadata,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        normed = _reference_rms_norm(hidden_states, self.input_layernorm)
+        hidden_states = self.self_attn.forward_packed_tree(
+            positions, normed, k_pool, v_pool, metadata,
+        )
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.mlp.forward_dense(
+            _reference_rms_norm(hidden_states, self.post_attention_layernorm)
+        )
+        return residual + hidden_states
+
 
 class Qwen3Model(nn.Module):
 
@@ -467,6 +519,42 @@ class Qwen3Model(nn.Module):
                 logical_slots,
                 qq_bias,
                 block_size,
+            )
+            if layer_id in tap_set:
+                tapped.append(hidden_states)
+        hidden_states = _reference_rms_norm(hidden_states, self.norm)
+        target_hidden = torch.cat(tapped, dim=-1) if tapped else None
+        return hidden_states, target_hidden
+
+    def forward_packed_tree(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_pool: torch.Tensor,
+        metadata,
+        target_layer_ids: list[int] | tuple[int, ...] = (),
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """One Target pass over the unpadded concatenation of all trees.
+
+        Dense projections/MLPs see exactly sum(T_i) rows. No per-request model
+        loop or padding hides behind this seam; only acceptance/commit are later
+        partitioned by the metadata's host query offsets.
+        """
+        if input_ids.ndim != 1 or positions.ndim != 1 or input_ids.shape != positions.shape:
+            raise ValueError("packed Target input IDs and RoPE positions must be flat equal-length vectors")
+        if input_ids.numel() != metadata.total_queries:
+            raise ValueError("packed Target input length does not match tree metadata")
+        if input_ids.device != kv_pool.device or positions.device != kv_pool.device:
+            raise ValueError("packed Target inputs and KV must be on one device")
+        metadata.validate_pool_geometry(kv_pool)
+        if kv_pool.shape[1] != len(self.layers):
+            raise ValueError("packed Target KV layer count differs from the model")
+        hidden_states = self.embed_tokens(input_ids)
+        tapped = []
+        tap_set = set(int(i) for i in target_layer_ids)
+        for layer_id, layer in enumerate(self.layers):
+            hidden_states = layer.forward_packed_tree(
+                positions, hidden_states, kv_pool[0, layer_id], kv_pool[1, layer_id], metadata,
             )
             if layer_id in tap_set:
                 tapped.append(hidden_states)

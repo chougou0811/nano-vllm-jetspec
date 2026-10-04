@@ -102,6 +102,7 @@ class TreeScratchArena:
     active: bool = False
     _stream: object | None = field(default=None, repr=False)
     _retired: object | None = field(default=None, repr=False)
+    _batch_transaction: object | None = field(default=None, repr=False)
 
     @property
     def capacity(self) -> int:
@@ -152,6 +153,8 @@ class TreeScratchArena:
                 self._retired.synchronize()
 
     def clear(self) -> int:
+        if self._batch_transaction is not None:
+            raise RuntimeError("abort the active batch transaction before clearing its arena")
         self.retire()
         self.synchronize()
         released = len(self.blocks)
@@ -183,6 +186,7 @@ class PagedTargetState:
     pending_blocks: list[int]
     scratch: TreeScratchArena | None = None
     _round: _TreeRound | None = field(default=None, repr=False)
+    _batch_transaction: object | None = field(default=None, repr=False)
     _cleared: bool = field(default=False, repr=False)
 
     @classmethod
@@ -282,6 +286,8 @@ class PagedTargetState:
         """
         if self._cleared:
             raise RuntimeError("cannot reserve a tree for a cleared request")
+        if self._batch_transaction is not None:
+            raise RuntimeError("request belongs to an active batch transaction")
         if self._round is not None or self.pending_blocks or self.scratch_active:
             raise RuntimeError("previous provisional tree transaction is still active")
         n_nodes = int(n_nodes)
@@ -333,6 +339,8 @@ class PagedTargetState:
         whose caller must publish tokens before asserting the round invariant.
         """
         transaction = self._round
+        if self._batch_transaction is not None:
+            raise RuntimeError("shared tree scratch must be committed by its batch transaction")
         if transaction is None or self.scratch is None or not self.scratch.active:
             raise RuntimeError("no provisional tree transaction to commit")
         self.scratch.check_stream()
@@ -391,6 +399,8 @@ class PagedTargetState:
 
     def abort_tree(self) -> int:
         """Discard the round without publishing any committed metadata."""
+        if self._batch_transaction is not None:
+            raise RuntimeError("shared tree scratch must be aborted by its batch transaction")
         if self._round is None:
             return 0
         if self.scratch is not None:
@@ -415,7 +425,7 @@ class PagedTargetState:
                 f"committed-1={expected}, logical_slots={self.cache_len}, "
                 f"target_hidden={self.target_hidden.shape[1]}"
             )
-        if self._round is not None or self.pending_blocks or self.scratch_active:
+        if self._round is not None or self._batch_transaction is not None or self.pending_blocks or self.scratch_active:
             raise RuntimeError("provisional tree transaction survived a completed round")
         expected_blocks = (self.cache_len + self.block_size - 1) // self.block_size
         if len(self.owned_blocks) != expected_blocks:
@@ -438,6 +448,8 @@ class PagedTargetState:
     def clear(self) -> int:
         if self._cleared:
             return 0
+        if self._batch_transaction is not None:
+            raise RuntimeError("abort the active batch transaction before clearing its request")
         aborted_released = self.abort_tree()
         # This also fences prefill-only requests, which have not retired scratch.
         if self.kv_pool.is_cuda:
@@ -452,3 +464,320 @@ class PagedTargetState:
         self.committed = torch.empty(0, dtype=torch.long, device=self.kv_pool.device)
         self._cleared = True
         return released
+
+
+@dataclass
+class _BatchCommitPlan:
+    source: torch.Tensor
+    destination: torch.Tensor
+    next_slots: torch.Tensor
+    next_hidden: torch.Tensor
+    next_tokens: torch.Tensor
+    next_owned_blocks: list[int]
+    unused_blocks: list[int]
+    accepted_count: int
+    copy_bytes: int
+
+
+@dataclass
+class BatchTreeTransaction:
+    """One atomic packed-tree round borrowing a runner-owned scratch arena.
+
+    Requests own only canonical committed pages and pending destination pages.
+    They never own, retire, or free the shared arena's pages. All destination
+    capacity and arena growth are admitted together before verification. One
+    accepted-only all-layer copy precedes publication of every request's state.
+    """
+
+    states: list[PagedTargetState]
+    arena: TreeScratchArena
+    node_slots: list[torch.Tensor]
+    packed_node_slots: torch.Tensor
+    ranges: list[tuple[int, int]]
+    max_path_lengths: list[int]
+    destination_counts: list[int]
+    newly_reserved_blocks: int
+    active: bool = True
+    committed: bool = False
+    _published: bool = field(default=False, repr=False)
+    result: dict | None = field(default=None, repr=False)
+
+    @property
+    def logical_slots(self) -> list[torch.Tensor]:
+        """Optional diagnostic maps; production packed attention uses page tables."""
+        return [torch.cat((state.logical_slots, nodes)) for state, nodes in zip(self.states, self.node_slots)]
+
+    @classmethod
+    def admit(
+        cls,
+        states: list[PagedTargetState],
+        node_counts: list[int],
+        max_path_lengths: list[int],
+        arena: TreeScratchArena,
+    ) -> "BatchTreeTransaction":
+        states = list(states)
+        counts = [int(count) for count in node_counts]
+        maxima = [int(length) for length in max_path_lengths]
+        if not states or len(states) != len(counts) or len(states) != len(maxima):
+            raise ValueError("batch requests, node counts and path bounds must align")
+        if len({id(state) for state in states}) != len(states):
+            raise ValueError("a request cannot occur twice in one packed batch")
+        if arena.active or arena._batch_transaction is not None:
+            raise RuntimeError("runner tree scratch is already leased")
+        all_owned = []
+        destination_counts = []
+        for state, n_nodes, maximum in zip(states, counts, maxima):
+            if state._cleared:
+                raise RuntimeError("cannot admit a cleared request")
+            if state.kv_pool is not arena.kv_pool or state.block_manager is not arena.block_manager or state.block_size != arena.block_size:
+                raise ValueError("batch requests and arena must use one KV pool and allocator")
+            if n_nodes <= 0 or not 1 <= maximum <= n_nodes:
+                raise ValueError("invalid packed tree size or maximum accepted path length")
+            state.assert_round_invariant()
+            all_owned.extend(state.owned_blocks + state.scratch_blocks)
+            needed = (state.cache_len + maximum + arena.block_size - 1) // arena.block_size
+            destination_counts.append(needed - len(state.owned_blocks))
+        if len(set(all_owned)) != len(all_owned) or set(all_owned).intersection(arena.blocks):
+            raise RuntimeError("batch request and arena ownership overlap")
+        total_nodes = sum(counts)
+        old_arena_count = len(arena.blocks)
+        scratch_growth = max(0, (total_nodes + arena.block_size - 1) // arena.block_size - old_arena_count)
+        total_destinations = sum(destination_counts)
+        new_blocks = arena.block_manager.reserve_provisional(total_destinations + scratch_growth)
+        try:
+            arena.blocks.extend(new_blocks[total_destinations:])
+            packed_nodes = arena.acquire(total_nodes)
+            ranges = []
+            nodes = []
+            offset = 0
+            for count in counts:
+                ranges.append((offset, offset + count))
+                nodes.append(packed_nodes[offset:offset + count])
+                offset += count
+            transaction = cls(
+                states, arena, nodes, packed_nodes, ranges, maxima,
+                destination_counts, len(new_blocks),
+            )
+            offset = 0
+            for state, count in zip(states, destination_counts):
+                state.pending_blocks = new_blocks[offset:offset + count]
+                state._batch_transaction = transaction
+                offset += count
+            arena._batch_transaction = transaction
+            return transaction
+        except BaseException:
+            arena.retire()
+            arena.synchronize()
+            arena.blocks = arena.blocks[:old_arena_count]
+            for state in states:
+                state.pending_blocks = []
+                state._batch_transaction = None
+            arena._batch_transaction = None
+            arena.block_manager.release_provisional(new_blocks)
+            raise
+
+    def capacity_snapshot(self) -> dict[str, int | float]:
+        committed = sum(len(state.owned_blocks) for state in self.states)
+        pending = sum(len(state.pending_blocks) for state in self.states)
+        private_scratch = sum(len(state.scratch_blocks) for state in self.states)
+        reserved = (committed + pending + private_scratch + len(self.arena.blocks)) * self.arena.block_size
+        live = sum(state.cache_len for state in self.states)
+        return {
+            "committed_blocks": committed,
+            "scratch_blocks": len(self.arena.blocks),
+            "private_scratch_blocks": private_scratch,
+            "pending_destination_blocks": pending,
+            "reserved_destination_blocks": pending,
+            "used_blocks": len(self.arena.block_manager.used_block_ids),
+            "reserved_slots": reserved,
+            "reserved_kv_slots": reserved,
+            "live_slots": live,
+            "live_kv_slots": live,
+            "amplification": reserved / live if live else 0.0,
+        }
+
+    def _prepare_commit(
+        self,
+        state: PagedTargetState,
+        nodes: torch.Tensor,
+        node_hidden: torch.Tensor,
+        path: torch.Tensor,
+        maximum: int,
+        tokens: torch.Tensor,
+    ) -> _BatchCommitPlan:
+        if path.ndim != 1:
+            raise ValueError("accepted path must be one-dimensional")
+        selected = path.to(device=nodes.device, dtype=torch.long)
+        indices = selected.tolist()
+        if not indices or indices[0] != 0 or len(set(indices)) != len(indices):
+            raise ValueError("accepted path must be root-inclusive and contain unique nodes")
+        if min(indices) < 0 or max(indices) >= nodes.numel() or len(indices) > maximum:
+            raise ValueError("accepted path exceeds admitted tree or destination bounds")
+        if node_hidden.ndim != 3 or tuple(node_hidden.shape[:2]) != (1, nodes.numel()):
+            raise ValueError("tree features do not match their request's tree")
+        next_length = state.cache_len + len(indices)
+        if tokens.ndim != 2 or tuple(tokens.shape) != (1, next_length + 1):
+            raise ValueError("published tokens must include exactly one uncached correction")
+        source = nodes.index_select(0, selected)
+        destination = _slots_for_blocks(
+            state.owned_blocks + state.pending_blocks, len(indices),
+            state.block_size, state.kv_pool.device, start=state.cache_len,
+        )
+        next_slots = torch.cat((state.logical_slots, destination))
+        next_hidden = torch.cat((state.target_hidden, node_hidden.index_select(1, selected)), dim=1)
+        needed = (next_length + state.block_size - 1) // state.block_size
+        used_destination = needed - len(state.owned_blocks)
+        retained = state.pending_blocks[:used_destination]
+        unused = state.pending_blocks[used_destination:]
+        # Every allocation/preparation that can fail happens before the copy.
+        next_owned = state.owned_blocks + retained
+        bytes_per_slot = int(state.kv_pool.shape[0] * state.kv_pool.shape[1] * state.kv_pool.shape[4] * state.kv_pool.shape[5] * state.kv_pool.element_size())
+        return _BatchCommitPlan(
+            source, destination, next_slots, next_hidden, tokens, next_owned,
+            unused, len(indices), len(indices) * bytes_per_slot,
+        )
+
+    def commit(
+        self,
+        node_hidden: list[torch.Tensor],
+        accepted_paths: list[torch.Tensor],
+        committed_tokens: list[torch.Tensor],
+    ) -> dict:
+        if not self.active or self.committed:
+            raise RuntimeError("packed tree transaction is no longer active")
+        self.arena.check_stream()
+        if len(node_hidden) != len(self.states) or len(accepted_paths) != len(self.states) or len(committed_tokens) != len(self.states):
+            raise ValueError("batch commit inputs must align with admitted requests")
+        plans = [
+            self._prepare_commit(state, nodes, hidden, path, maximum, tokens)
+            for state, nodes, hidden, path, maximum, tokens in zip(
+                self.states, self.node_slots, node_hidden, accepted_paths,
+                self.max_path_lengths, committed_tokens,
+            )
+        ]
+        source = torch.cat([plan.source for plan in plans])
+        destination = torch.cat([plan.destination for plan in plans])
+        unused = [block for plan in plans for block in plan.unused_blocks]
+        request_metrics = [
+            {
+                "accepted_kv_slots": plan.accepted_count,
+                "kv_copy_bytes": plan.copy_bytes,
+                "rejected_logical_slots": int(nodes.numel()) - plan.accepted_count,
+                "reserved_destination_blocks": count,
+                "released_blocks": len(plan.unused_blocks),
+                "committed_blocks": len(plan.next_owned_blocks),
+                "live_kv_slots": int(plan.next_slots.numel()),
+            }
+            for plan, nodes, count in zip(plans, self.node_slots, self.destination_counts)
+        ]
+        original = [
+            (state.owned_blocks, state.pending_blocks, state.logical_slots,
+             state.target_hidden, state.committed)
+            for state in self.states
+        ]
+        committed_blocks = sum(len(plan.next_owned_blocks) for plan in plans)
+        private_scratch = sum(len(state.scratch_blocks) for state in self.states)
+        reserved_slots = (committed_blocks + private_scratch + len(self.arena.blocks)) * self.arena.block_size
+        live_slots = sum(int(plan.next_slots.numel()) for plan in plans)
+        result = {
+            "committed_blocks": committed_blocks,
+            "scratch_blocks": len(self.arena.blocks),
+            "private_scratch_blocks": private_scratch,
+            "pending_destination_blocks": 0,
+            "used_blocks": len(self.arena.block_manager.used_block_ids) - len(unused),
+            "reserved_slots": reserved_slots,
+            "reserved_kv_slots": reserved_slots,
+            "live_slots": live_slots,
+            "live_kv_slots": live_slots,
+            "amplification": reserved_slots / live_slots if live_slots else 0.0,
+            "request_metrics": request_metrics,
+            "kv_copy_bytes": sum(plan.copy_bytes for plan in plans),
+            "accepted_kv_slots": sum(plan.accepted_count for plan in plans),
+            "rejected_logical_slots": sum(int(nodes.numel()) - plan.accepted_count for plan, nodes in zip(plans, self.node_slots)),
+            "reserved_blocks": self.newly_reserved_blocks,
+            "reserved_destination_blocks": sum(self.destination_counts),
+            "released_blocks": len(unused),
+        }
+        self.result = result
+        copy_bytes = copy_accepted_kv(self.arena.kv_pool, source, destination, self.arena.block_size)
+        if copy_bytes != result["kv_copy_bytes"]:
+            raise RuntimeError("accepted KV copy byte count differs from prepared batch payload")
+        self.arena.retire()
+        # Publish without freeing anything first, so an interrupted publication
+        # can restore all old metadata and let abort() reclaim every destination.
+        try:
+            for state, plan in zip(self.states, plans):
+                state.owned_blocks = plan.next_owned_blocks
+                state.pending_blocks = []
+                state.logical_slots = plan.next_slots
+                state.target_hidden = plan.next_hidden
+                state.committed = plan.next_tokens
+            self._published = True
+            self.arena.block_manager.release_provisional(unused)
+            self.committed = True
+        except BaseException:
+            # An interruption can land after release_provisional completed but
+            # before this frame received its return. The allocator guarantees
+            # either a full rollback (all these pages still used) or a completed
+            # release. Once all metadata is published and all unused pages have
+            # been released, the round is terminal: never restore old ownership.
+            released = self._published and all(
+                block_id not in self.arena.block_manager.used_block_ids
+                and self.arena.block_manager.blocks[block_id].ref_count == 0
+                for block_id in unused
+            )
+            if released:
+                self.committed = True
+                self.finish_committed()
+                raise
+            for state, previous in zip(self.states, original):
+                state.owned_blocks, state.pending_blocks, state.logical_slots, state.target_hidden, state.committed = previous
+            self._published = False
+            raise
+        self.finish_committed()
+        return result
+
+    def finish_committed(self) -> None:
+        """Idempotently finish guards after the irreversible publication point.
+
+        ``committed`` stays true even if one interruption lands during cleanup.
+        The caller can publish its precomputed outputs and retry this method (or
+        abort()). This is not a guarantee against repeated asynchronous signals
+        interrupting the recovery itself or a process being killed outright.
+        """
+        if not self.committed:
+            raise RuntimeError("cannot finalize an uncommitted packed transaction")
+        if not self.active:
+            return
+        for state in self.states:
+            if state._batch_transaction is self:
+                # Publish readiness before allowing independent request clear.
+                # Borrow only the event, never arena page ownership.
+                if state.scratch is not None:
+                    state.scratch._retired = self.arena._retired
+                state._batch_transaction = None
+        if self.arena._batch_transaction is self:
+            self.arena._batch_transaction = None
+        self.active = False
+
+    def abort(self) -> int:
+        if not self.active:
+            return 0
+        if self.committed:
+            self.finish_committed()
+            return 0
+        self.arena.retire()
+        pending = [block for state in self.states for block in state.pending_blocks]
+        if pending:
+            # Verification or a failed copy can still be using destination/scratch
+            # pages. No returned page may be reused before its stream completes.
+            self.arena.synchronize()
+        self.arena.block_manager.release_provisional(pending)
+        for state in self.states:
+            state.pending_blocks = []
+            if state.scratch is not None:
+                state.scratch._retired = self.arena._retired
+            state._batch_transaction = None
+        self.arena._batch_transaction = None
+        self.active = False
+        return len(pending)

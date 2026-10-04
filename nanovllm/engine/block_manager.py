@@ -83,10 +83,24 @@ class BlockManager:
             block = self.blocks[block_id]
             if block.ref_count != 1 or block_id not in self.used_block_ids:
                 raise RuntimeError(f"invalid provisional block ownership: {block_id}")
-        for block_id in normalized:
-            block = self.blocks[block_id]
-            block.ref_count = 0
-            self._deallocate_block(block_id)
+        try:
+            for block_id in normalized:
+                block = self.blocks[block_id]
+                block.ref_count = 0
+                self._deallocate_block(block_id)
+        except BaseException:
+            # Deallocation mutates only this block's used membership and appends
+            # its ID to the free deque. Restore the entire validated release if
+            # an exception/cancellation interrupts either mutation. The normal
+            # path remains O(number of released pages), with no pool snapshots.
+            for block_id in normalized:
+                self.blocks[block_id].ref_count = 1
+                self.used_block_ids.add(block_id)
+                try:
+                    self.free_block_ids.remove(block_id)
+                except ValueError:
+                    pass
+            raise
 
     def can_allocate(self, seq: Sequence) -> int:
         h = -1
