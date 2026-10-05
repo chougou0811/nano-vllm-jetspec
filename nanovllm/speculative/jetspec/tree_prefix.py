@@ -459,6 +459,19 @@ def packed_tree_attention_prefix_split_exact(q, k_pool, v_pool, metadata, scale,
                                                num_queries_per_kv,
                                                output_dtype=output_dtype)
     out = _validate(q, k_pool, v_pool, metadata, num_queries_per_kv, output_dtype)
+    return packed_tree_attention_prefix_prevalidated(q, k_pool, v_pool, metadata,
+        scale, num_queries_per_kv, out, num_warps=num_warps)
+
+
+def packed_tree_attention_prefix_prevalidated(q, k_pool, v_pool, metadata, scale,
+                                             num_queries_per_kv, out, *, num_warps=4):
+    """Internal serving launch after dispatcher validation/output allocation.
+
+    The checked standalone entry above calls this SAME JIT launch. Avoid
+    repeated Q/K/V/device checks and a second output preparation in every
+    Target layer. Callers must already establish CUDA/page/head geometry;
+    this is not an unchecked alternative public attention backend.
+    """
     _packed_tree_prefix_split_exact_fp32[(metadata.total_queries, q.shape[1])](
         out, q, k_pool, v_pool,
         metadata.query_to_request, metadata.query_local_row,

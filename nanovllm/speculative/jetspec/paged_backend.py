@@ -273,11 +273,15 @@ def packed_tree_attention(
         from nanovllm.speculative.jetspec.tree_attention import packed_tree_attention_reference
         return packed_tree_attention_reference(q, k_pool, v_pool, metadata, scale,
             num_queries_per_kv, output_dtype=output_dtype)
-    if backend == "prefix" or _use_prefix_tree_attention(q, k_pool, v_pool, metadata, num_queries_per_kv):
+    if backend == "prefix":
         from nanovllm.speculative.jetspec.tree_prefix import packed_tree_attention_prefix_split_exact
         return packed_tree_attention_prefix_split_exact(q, k_pool, v_pool, metadata, scale,
             num_queries_per_kv, output_dtype=output_dtype, num_warps=4)
-    out = torch.empty_like(q, dtype=output_dtype or q.dtype)
+    out = torch.empty_like(q) if output_dtype is None else torch.empty_like(q, dtype=output_dtype)
+    if _use_prefix_tree_attention(q, k_pool, v_pool, metadata, num_queries_per_kv):
+        from nanovllm.speculative.jetspec.tree_prefix import packed_tree_attention_prefix_prevalidated
+        return packed_tree_attention_prefix_prevalidated(q, k_pool, v_pool, metadata, scale,
+            num_queries_per_kv, out, num_warps=4)
     _packed_paged_tree_fp32[(total_q, num_query_heads)](
         out, q, k_pool, v_pool,
         metadata.query_to_request, metadata.query_local_row,

@@ -45,9 +45,10 @@ class TreeDispatchTests(unittest.TestCase):
     def test_auto_uses_measured_prefix_path_without_changing_operands(self):
         args, marker = inputs(), object()
         with patch.object(paged_backend, "_tree_attention_device_capability", return_value=(12, 0)), \
-                patch.object(tree_prefix, "packed_tree_attention_prefix_split_exact", return_value=marker) as call:
+                patch.object(paged_backend.torch, "empty_like", return_value=marker), \
+                patch.object(tree_prefix, "packed_tree_attention_prefix_prevalidated", return_value=marker) as call:
             self.assertIs(paged_backend.packed_tree_attention(*args), marker)
-        call.assert_called_once_with(*args, output_dtype=None, num_warps=4)
+        call.assert_called_once_with(*args, marker, num_warps=4)
 
     def test_c1_short_prefix_and_ragged_boundary_selection(self):
         with patch.object(paged_backend, "_tree_attention_device_capability", return_value=(12, 0)):
