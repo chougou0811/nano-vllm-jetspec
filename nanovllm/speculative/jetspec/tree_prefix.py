@@ -204,7 +204,7 @@ def _packed_tree_prefix_single_loop_fp32(
                 + (tile_idx * TILE) // block_size,
             ).to(tl.int64)
             physical_block = prefix_page + tl.zeros((TILE,), tl.int64)
-            physical_offset = key_pos % block_size
+            physical_offset = (key_pos % block_size).to(tl.int64)
         else:
             prefix_block = tl.load(
                 block_tables_ptr + request * table_stride_0 + key_pos // block_size,

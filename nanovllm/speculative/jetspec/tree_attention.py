@@ -165,3 +165,39 @@ def packed_tree_attention_gqa(q, k_pool, v_pool, metadata, scale,
         BLOCK_D=triton.next_power_of_2(q.shape[-1]), TILE=64, num_warps=num_warps,
     )
     return out
+
+
+def packed_tree_attention_register_tuned(q, k_pool, v_pool, metadata, scale,
+                                        num_queries_per_kv, *, output_dtype=None,
+                                        maxnreg=96):
+    """Launch the exact frozen kernel with an explicit register-allocation cap.
+
+    This experiment changes only CUDA ``maxnreg``; the kernel source, scalar
+    (query, head) grid, 4 warps, TILE64, strides, FP32 arithmetic and visibility
+    are unchanged. A register cap can cause spills/scheduling changes and is
+    not a performance or bitwise-equivalence guarantee. Real same-state model
+    and microbenchmark qualification is required before any serving dispatch.
+    """
+    if isinstance(maxnreg, bool) or maxnreg not in (64, 80, 96, 112, 128):
+        raise ValueError("maxnreg must be 64, 80, 96, 112 or 128")
+    from nanovllm.speculative.jetspec.paged_backend import _packed_paged_tree_fp32
+
+    out = _validate(q, k_pool, v_pool, metadata, num_queries_per_kv, output_dtype)
+    _packed_paged_tree_fp32[(metadata.total_queries, q.shape[1])](
+        out, q, k_pool, v_pool,
+        metadata.query_to_request, metadata.query_local_row,
+        metadata.prefix_lens, metadata.node_counts, metadata.cu_seqlens_q,
+        metadata.block_tables, metadata.tree_slots, metadata.qq_bias, metadata.qq_bias_offsets,
+        scale,
+        q_stride_0=q.stride(0), q_stride_1=q.stride(1),
+        out_stride_0=out.stride(0), out_stride_1=out.stride(1),
+        table_stride_0=metadata.block_tables.stride(0),
+        k_stride_0=k_pool.stride(0), k_stride_1=k_pool.stride(1),
+        k_stride_2=k_pool.stride(2), k_stride_3=k_pool.stride(3),
+        v_stride_0=v_pool.stride(0), v_stride_1=v_pool.stride(1),
+        v_stride_2=v_pool.stride(2), v_stride_3=v_pool.stride(3),
+        num_queries_per_kv=num_queries_per_kv, block_size=metadata.block_size,
+        head_size=q.shape[-1], BLOCK_D=triton.next_power_of_2(q.shape[-1]),
+        TILE=64, num_warps=4, maxnreg=maxnreg,
+    )
+    return out
