@@ -149,7 +149,8 @@ class PrefillContext:
         return released
 
 
-def forward_chunk(target, context: PrefillContext, num_tokens: int, target_layer_ids):
+def forward_chunk(target, context: PrefillContext, num_tokens: int, target_layer_ids,
+                  *, attention_backend="sdpa"):
     """Production paged incremental seam; compatibility fallback for CPU mocks."""
     prefix_slots, new_slots = context.reserve(num_tokens)
     start, count = context.processed_tokens, int(new_slots.numel())
@@ -159,9 +160,14 @@ def forward_chunk(target, context: PrefillContext, num_tokens: int, target_layer
     incremental = getattr(target.model, "forward_dense_chunk", None)
     if incremental is not None:
         hidden, taps = incremental(ids, positions, context.kv_pool, prefix_slots,
-                                   new_slots, target_layer_ids)
-        backend = "paged_layerwise_dense_chunk"
+                                   new_slots, target_layer_ids,
+                                   **({"attention_backend": attention_backend}
+                                      if attention_backend != "sdpa" else {}))
+        backend = ("paged_layerwise_flash_chunk" if attention_backend == "flash_attn"
+                   else "paged_layerwise_dense_chunk")
     else:
+        if attention_backend != "sdpa":
+            raise ValueError("Flash chunked prefill requires the real Qwen3 incremental seam")
         # Existing lightweight fake Targets expose only forward_dense. Real
         # Qwen3 never takes this all-layer dense-history compatibility path.
         pages, offsets = prefix_slots // context.block_size, prefix_slots % context.block_size

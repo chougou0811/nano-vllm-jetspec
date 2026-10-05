@@ -53,7 +53,7 @@ class LLMEngine:
                          default_tree_budget: int = 63, max_admissions_per_step: int = 2,
                          max_prefill_tokens: int | None = None,
                          enable_chunked_prefill: bool = True, prefill_chunk_size: int = 256,
-                         optimization: str = "serving"):
+                         optimization: str = "serving", attention_backend: str = "sdpa"):
         """Select the greedy Continuous Batching adapter for add/step/cancel.
 
         Like nano-vLLM's ordinary engine this is a synchronous event loop, not
@@ -61,6 +61,8 @@ class LLMEngine:
         processed between steps; one packed Target verify executes per decode.
         Chunked initial/recompute prefill runs between decode rounds. Its token
         budget is separate from the packed verification query budget.
+        External FlashAttention is opt-in for causal prefill and ragged Draft;
+        the qualified FP32 packed tree verification backend remains unchanged.
         """
         serving = getattr(self, "_jetspec_scheduler", None)
         if serving is not None:
@@ -71,13 +73,16 @@ class LLMEngine:
             raise ValueError("default tree budget must fit the configured maximum")
         if optimization not in ("serving", "debug"):
             raise ValueError("JetSpec optimization must be 'serving' or 'debug'")
+        if attention_backend not in ("sdpa", "flash_attn"):
+            raise ValueError("JetSpec attention backend must be 'sdpa' or 'flash_attn'")
         runtime = self.get_jetspec_batch_runtime(draft_model, tree_depth=tree_depth,
             tree_width=tree_width, max_tree_budget=max_tree_budget)
         if runtime.requests or getattr(runtime, "prefills", {}):
             raise RuntimeError("cannot enter serving mode with explicit packed requests")
         optimized = optimization == "serving"
         runtime.configure_optimizations(lightweight=optimized, batched_draft=optimized,
-                                        feature_storage=optimized)
+                                        feature_storage=optimized,
+                                        attention_backend=attention_backend)
         from nanovllm.engine.jetspec_scheduler import JetSpecScheduler
         config = self.model_runner.config
         self._jetspec_scheduler = JetSpecScheduler(runtime, config.max_num_seqs,

@@ -103,6 +103,7 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         past_key_value: tuple[torch.Tensor, torch.Tensor] | None,
         attention_mask: torch.Tensor | None,
+        *, flash_metadata=None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """Correctness-first SDPA seam used only by the opt-in JetSpec runtime.
 
@@ -151,6 +152,12 @@ class Qwen3Attention(nn.Module):
             v_all = torch.cat((past_key_value[1], v), dim=0)
         else:
             k_all, v_all = k, v
+        if flash_metadata is not None:
+            if attention_mask is not None:
+                raise ValueError("causal FlashAttention cannot replace an arbitrary tree mask")
+            from nanovllm.speculative.jetspec.flash_prefill import flash_causal_prefill
+            out = flash_causal_prefill(q, k_all, v_all, flash_metadata, self.scaling)
+            return self.o_proj(out.flatten(1, -1)), new_key_value
         groups = self.num_heads // self.num_kv_heads
         q_sdpa = q.transpose(0, 1).unsqueeze(0)
         k_sdpa = k_all.transpose(0, 1).unsqueeze(0)
@@ -380,13 +387,15 @@ class Qwen3DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         past_key_value: tuple[torch.Tensor, torch.Tensor] | None,
         attention_mask: torch.Tensor | None,
+        *, flash_metadata=None,
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         # Unlike nano's regular fused-residual path, keep the materialized BF16
         # residual stream at every layer to match the HF reference operation order.
         residual_stream = hidden_states
         normed = _reference_rms_norm(hidden_states, self.input_layernorm)
         attn_output, new_key_value = self.self_attn.forward_dense(
-            positions, normed, past_key_value, attention_mask
+            positions, normed, past_key_value, attention_mask,
+            **({"flash_metadata": flash_metadata} if flash_metadata is not None else {}),
         )
         hidden_states = residual_stream + attn_output
         residual_stream = hidden_states
@@ -477,7 +486,18 @@ class Qwen3Model(nn.Module):
         past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None,
         attention_mask: torch.Tensor | None,
         target_layer_ids: list[int] | tuple[int, ...] = (),
+        *, attention_backend: str = "sdpa",
     ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor | None]:
+        if attention_backend not in ("sdpa", "flash_attn"):
+            raise ValueError("unsupported JetSpec dense attention backend")
+        flash_metadata = None
+        if attention_backend == "flash_attn":
+            if attention_mask is not None:
+                raise ValueError("Flash prefill does not accept an arbitrary attention mask")
+            from nanovllm.speculative.jetspec.flash_prefill import FlashPrefillMetadata
+            prefix = 0 if past_key_values is None else past_key_values[0][0].shape[0]
+            flash_metadata = FlashPrefillMetadata.build(
+                input_ids.numel(), prefix + input_ids.numel(), input_ids.device)
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         new_key_values = []
@@ -486,7 +506,8 @@ class Qwen3Model(nn.Module):
         for layer_id, layer in enumerate(self.layers):
             past = None if past_key_values is None else past_key_values[layer_id]
             hidden_states, residual, new_kv, post_hidden = layer.forward_dense(
-                positions, hidden_states, residual, past, attention_mask
+                positions, hidden_states, residual, past, attention_mask,
+                **({"flash_metadata": flash_metadata} if flash_metadata is not None else {}),
             )
             new_key_values.append(new_kv)
             if layer_id in tap_set:
@@ -530,6 +551,7 @@ class Qwen3Model(nn.Module):
         self, input_ids: torch.Tensor, positions: torch.Tensor,
         kv_pool: torch.Tensor, prefix_slots: torch.Tensor, new_slots: torch.Tensor,
         target_layer_ids: list[int] | tuple[int, ...] = (),
+        *, attention_backend: str = "sdpa",
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Incremental correctness-first prefill using private canonical pages.
 
@@ -546,7 +568,15 @@ class Qwen3Model(nn.Module):
         block_size = int(kv_pool.shape[3])
         prefix_pages, prefix_offsets = prefix_slots // block_size, prefix_slots % block_size
         new_pages, new_offsets = new_slots // block_size, new_slots % block_size
-        mask = offset_causal_mask(int(prefix_slots.numel()), int(input_ids.numel()), input_ids.device)
+        if attention_backend not in ("sdpa", "flash_attn"):
+            raise ValueError("unsupported JetSpec chunked attention backend")
+        flash_metadata = None
+        if attention_backend == "flash_attn":
+            from nanovllm.speculative.jetspec.flash_prefill import FlashPrefillMetadata
+            flash_metadata = FlashPrefillMetadata.build(
+                input_ids.numel(), prefix_slots.numel() + input_ids.numel(), input_ids.device)
+        mask = None if flash_metadata is not None else offset_causal_mask(
+            int(prefix_slots.numel()), int(input_ids.numel()), input_ids.device)
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         tapped = []
@@ -555,7 +585,8 @@ class Qwen3Model(nn.Module):
             past = (kv_pool[0, layer_id, prefix_pages, prefix_offsets],
                     kv_pool[1, layer_id, prefix_pages, prefix_offsets]) if prefix_slots.numel() else None
             hidden_states, residual, new_kv, post_hidden = layer.forward_dense(
-                positions, hidden_states, residual, past, mask)
+                positions, hidden_states, residual, past, mask,
+                **({"flash_metadata": flash_metadata} if flash_metadata is not None else {}))
             keys, values = new_kv
             if (tuple(keys.shape) != (input_ids.numel(), *kv_pool.shape[4:]) or
                     tuple(values.shape) != tuple(keys.shape)):

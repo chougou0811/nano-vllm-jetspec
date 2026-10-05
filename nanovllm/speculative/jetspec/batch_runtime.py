@@ -79,6 +79,7 @@ class JetSpecBatchRuntime:
         self._lightweight = False
         self._batched_draft_enabled = False
         self._feature_storage = False
+        self._attention_backend = "sdpa"
         self._batch_proposer = None
         self.eos_token_ids = set()
         for value in (getattr(tokenizer, "eos_token_id", None),
@@ -87,14 +88,22 @@ class JetSpecBatchRuntime:
                 self.eos_token_ids.update(value if isinstance(value, (list, tuple, set)) else [value])
 
     def configure_optimizations(self, *, lightweight=False, batched_draft=False,
-                                feature_storage=False):
+                                feature_storage=False, attention_backend="sdpa"):
         """Select independently measurable serving paths at an idle boundary."""
         self._check_idle()
         if self.requests or getattr(self, "prefills", {}):
             raise RuntimeError("optimization policy cannot change with live requests")
+        if attention_backend not in ("sdpa", "flash_attn"):
+            raise ValueError("JetSpec attention backend must be 'sdpa' or 'flash_attn'")
+        if attention_backend == "flash_attn":
+            if not batched_draft:
+                raise ValueError("FlashAttention Draft requires the batched serving adapter")
+            from nanovllm.speculative.jetspec.flash_prefill import require_flash_attention
+            require_flash_attention()
         self._lightweight = bool(lightweight)
         self._batched_draft_enabled = bool(batched_draft)
         self._feature_storage = bool(feature_storage)
+        self._attention_backend = attention_backend
         self._batch_proposer = None
 
     def _configure_state(self, state):
@@ -199,7 +208,9 @@ class JetSpecBatchRuntime:
             raise RuntimeError("insufficient KV blocks for prefill chunk")
         try:
             reset_context()
-            hidden = forward_chunk(self.target, context, count, self.target_layer_ids)
+            hidden = forward_chunk(self.target, context, count, self.target_layer_ids,
+                **({"attention_backend": self._attention_backend}
+                   if getattr(self, "_attention_backend", "sdpa") != "sdpa" else {}))
             if context.remaining_tokens:
                 return None
             context.begin_writes()
@@ -281,6 +292,8 @@ class JetSpecBatchRuntime:
         hidden, prompt_kv, taps = self.target.model.forward_dense(
             ids[0], torch.arange(prompt_length, device=ids.device), None, None,
             self.target_layer_ids,
+            **({"attention_backend": self._attention_backend}
+               if getattr(self, "_attention_backend", "sdpa") != "sdpa" else {}),
         )
         # Only the final prompt row predicts the first output. The debug path
         # retains the qualified full-prefill GEMM shape for numerical controls.
@@ -420,6 +433,8 @@ class JetSpecBatchRuntime:
         reset_context()
         _, prompt_kv, taps = self.target.model.forward_dense(
             prefix, torch.arange(prefix.numel(), device=ids.device), None, None, self.target_layer_ids,
+            **({"attention_backend": self._attention_backend}
+               if getattr(self, "_attention_backend", "sdpa") != "sdpa" else {}),
         )
         state = None
         try:
@@ -461,8 +476,12 @@ class JetSpecBatchRuntime:
             return []
         if getattr(self, "_batched_draft_enabled", False) and hasattr(self, "head"):
             if self._batch_proposer is None:
-                from nanovllm.speculative.jetspec.batched_draft import BatchedDraftProposer
-                self._batch_proposer = BatchedDraftProposer(self.head, self.target)
+                if getattr(self, "_attention_backend", "sdpa") == "flash_attn":
+                    from nanovllm.speculative.jetspec.flash_draft import FlashDraftProposer
+                    self._batch_proposer = FlashDraftProposer(self.head, self.target)
+                else:
+                    from nanovllm.speculative.jetspec.batched_draft import BatchedDraftProposer
+                    self._batch_proposer = BatchedDraftProposer(self.head, self.target)
             return self._batch_proposer.propose(requests, depth=self.tree_depth)
         return [r.drafter.propose_logits(r.state.committed, self.tree_depth,
                                         target_hidden=r.state.target_hidden) for r in requests]
