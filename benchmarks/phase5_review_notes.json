@@ -1,0 +1,103 @@
+{
+  "scope": "Phase-5 internal Final JetSpec kernel ablation, NOT a fresh upstream AR speedup measurement.",
+  "selected_production_revision": "f1175bbbcf801a78c93eefb8ef44ea10ccfbc437",
+  "reference_production_revision": "6f65f6e8500b032f590e05aca95602285f5bc24c",
+  "implemented": [
+    "Complete TILE64 prefix tiles resolve one scalar page-table entry; mixed prefix/tree tail retains frozen addressing.",
+    "Same scalar-query FP32 reduction/online-softmax expressions, FP32 probabilities, TILE64 grouping and 4 warps.",
+    "Serving dispatcher validates once, prepares empty_like output once and calls the exact standalone entry's prevalidated JIT launcher.",
+    "Cached device-capability query and host-owned metadata selection; no new device materialization or synchronization.",
+    "Measured SM120/BF16/Qwen3 geometry only; unsupported configurations and short c1 prefixes retain frozen reference."
+  ],
+  "unchanged": [
+    "Draft/Target prefill attention backend: SDPA",
+    "tree budgets/depth/width",
+    "arrival/output manifest",
+    "serving/admission/commit policy",
+    "KV pool/block size",
+    "FP32 1e-4 and BF16 2^-6 gates",
+    "Chunked Prefill capability; disabled for formal performance",
+    "CUDA Graph/TP2/kernel-fusion not implemented in this round"
+  ],
+  "observed_regressions": {
+    "c1_output128_percent": -1.6,
+    "c1_output512_percent": -1.1,
+    "caveat": "Use the publication's exact ratios; rounded summary here. Only three samples per arm, no statistical significance claimed; regressions are not discarded."
+  },
+  "test_runs": [
+    {
+      "checkout": "/root/autodl-tmp/jetspec-phase5-j4B2yW/lean-candidate",
+      "revision": "f1175bb",
+      "command": "PYTHONPATH=/root/autodl-tmp/projects/JetSpec python -m unittest discover -s tests -q",
+      "tests": 399,
+      "passed": 392,
+      "skipped": 7,
+      "errors": 0
+    },
+    {
+      "checkout": "/root/autodl-tmp/jetspec-phase5-j4B2yW/lean-candidate",
+      "revision": "f1175bb",
+      "command": "RUN_JETSPEC_TREE_KERNEL_GPU_TESTS=1 python -m unittest discover -s tests -p test_jetspec_tree_kernel.py -v",
+      "tests": 22,
+      "passed": 22,
+      "skipped": 0,
+      "errors": 0,
+      "note": "18 CPU oracle/harness checks plus four CUDA grouped-layout controls; production prefix is independently qualified by the full-model artifact."
+    },
+    {
+      "checkout": "/root/autodl-tmp/jetspec-phase5-j4B2yW/final-candidate",
+      "revision": "2f9e1c6",
+      "command": "RUN_JETSPEC_PACKED_GPU_TESTS=1 python -m unittest discover -s tests -p test_jetspec_packed_attention.py -v",
+      "tests": 8,
+      "passed": 8,
+      "skipped": 0,
+      "errors": 0
+    }
+  ],
+  "profile_comparison": {
+    "window": "c8/output512, four late Target verification rounds; one dynamic prefill also appears.",
+    "common_node_counts_deliveries_request_emissions_match": true,
+    "baseline_missing_prefix_lengths_before_step": true,
+    "caveat": "Compare common raw fields only. Future captures added explicit before-step prefix lengths; one freshly admitted request has null before-step ownership.",
+    "attention_gpu_kernel_ms": {
+      "reference": 78.32075899999997,
+      "candidate": 73.991872
+    },
+    "launches": {
+      "reference": 16358,
+      "candidate": 16358
+    },
+    "sync_calls": {
+      "reference": 142,
+      "candidate": 142
+    },
+    "no_launch_or_synchronization_reduction_claimed": true,
+    "stage_stream_clocks_include_host_idle_and_profile_overhead": true
+  },
+  "ncu": {
+    "version": "2025.1.1.0",
+    "command": "ncu --target-processes all --set basic --launch-count 1 python -c 'torch.ones(...,device=cuda); ...'",
+    "exit_code": 1,
+    "raw_output": "==PROF== Connected to process 128370 (/root/miniconda3/bin/python3.12)\n==ERROR== ERR_NVGPUCTRPERM - The user does not have permission to access NVIDIA GPU Performance Counters on the target device 0. For instructions on enabling permissions and to get more information see https://developer.nvidia.com/ERR_NVGPUCTRPERM\n2048.0\n==PROF== Disconnected from process 128370\n",
+    "GPU_performance_counters_available": false,
+    "hardware_occupancy_bandwidth_not_measured": true,
+    "driver_or_security_permissions_modified": false
+  },
+  "workspace_preservation": {
+    "README_sha256": "857bb3af8a1a6f2d8604666ec9d0ca15bcfa912a5c8c0fbbcf51e42dfc2d20b6",
+    "user_runtime_git_blob": "32cab56bbeee4981ef346f446b7e2aedc0f8e106",
+    "historical_matched_sha256": "179d648ed75c4f7a46727d9ce546af61655bcab6a957b8416546bafb1edfc89e",
+    "historical_upstream_flashattn_sha256": "c4d9b2aea709b5f8a959223ca3ad31d2be13529e053a9736ebac7f08a457c110",
+    "user_runtime_and_README_uncommitted_changes_not_staged": true,
+    "existing_dirty_worktree_failures": {
+      "tests": 399,
+      "errors": 4,
+      "skipped": 7,
+      "test": "test_runtime_public_wrapper_finally_covers_errors_and_cancellation",
+      "subtests": "generate/generate_target_paged x RuntimeError/KeyboardInterrupt",
+      "reason": "Preserved user legacy runtime.py changes bypass the qualified exception-cleanup wrappers; four fixture subtests still raise AttributeError for missing target.",
+      "user_requested_changes_preserved": true
+    },
+    "qualifications_and_serving_measured_clean_detached_sources_not_dirty_workspace": true
+  }
+}

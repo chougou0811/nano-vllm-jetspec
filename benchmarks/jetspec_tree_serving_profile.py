@@ -129,7 +129,7 @@ class LateWindow(AbstractContextManager):
             top_cpu_operators=operators[:80], cpu_operation_categories=categorize_cpu(operators),
             phase_ranges=[r for r in operators if r["operator"].startswith("phase5.")],
             attention_cuda_activity=[r for r in result["kernel_names"]
-                if "paged_tree" in r["name"] or "tree_attention" in r["name"]],
+                if any(name in r["name"] for name in ("paged_tree", "tree_attention", "packed_tree"))],
             cpu_category_note="Overlapping operator buckets; elementwise is a norm/RoPE proxy, not exclusive norm/RoPE attribution. CUDA kernels and parent phase ranges are available in Chrome trace.",
             synchronization_scope="Only bounded late serving window; profiler may introduce additional synchronization. Preparation/warmup excluded.",
             duration_note="Summed observed CUDA kernel duration is not end-to-end wall time, and overlapping ranges must not be added.")

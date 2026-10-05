@@ -285,10 +285,13 @@ def main():
     parser.add_argument("--profile", action="append", default=[],
                         help="reference=path or candidate=path; multiple captures use candidate:c8=path etc")
     parser.add_argument("--negative", action="append", default=[], help="unique experiment-label=path; original failures preserved")
+    parser.add_argument("--review", help="optional attributed test/profile/workspace notes; does not change any gate")
     args = parser.parse_args()
     evidence, artifacts = {}, {}
     inputs = [args.reference, args.candidate, args.micro, args.qualification]
     inputs += [path for _, path in named_paths(args.profile) + named_paths(args.negative)]
+    if args.review:
+        inputs.append(args.review)
     require(Path(args.output).resolve() not in {Path(path).resolve() for path in inputs}, "publication must not overwrite raw evidence")
     for name in ("reference", "candidate", "micro", "qualification"):
         evidence[name], artifacts[name] = load(getattr(args, name))
@@ -301,6 +304,10 @@ def main():
     negatives = [(label, *load(path)) for label, path in named_paths(args.negative)]
     result = publication(**evidence, profiles=profiles, negatives=negatives)
     result["full_raw_artifacts"] = artifacts
+    if args.review:
+        notes, artifact = load(args.review)
+        result["review_notes"] = {"artifact": artifact, "notes": notes,
+            "supplemental_only_not_a_substitute_for_bound_qualification": True}
     result["publisher_source"] = {"path": str(Path(__file__).resolve()), "sha256": file_sha(__file__),
                                   "CPU_only_stdlib_postprocessing": True}
     target = Path(args.output)
