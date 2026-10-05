@@ -1,3 +1,5 @@
+import ast
+import inspect
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -100,6 +102,45 @@ class TreePrefixTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid Q/K/V"):
                 tree_prefix.packed_tree_attention_prefix(*self.inputs())
         kernel.assert_not_called()
+
+    def test_single_loop_variant_uses_frozen_grid_tile_and_warps(self):
+        args = self.inputs()
+        output, kernel = FakeTensor((94, 32, 128)), Launch()
+        with patch.object(tree_prefix, "_validate", return_value=output) as validate, \
+                patch.object(tree_prefix, "_packed_tree_prefix_single_loop_fp32", kernel):
+            result = tree_prefix.packed_tree_attention_prefix_single_loop(*args, output_dtype=torch.float32)
+        self.assertIs(result, output)
+        validate.assert_called_once_with(args[0], args[1], args[2], args[3], 4, torch.float32)
+        self.assertEqual(kernel.grid, (94, 32))
+        self.assertEqual(kernel.kwargs["TILE"], 64)
+        self.assertEqual(kernel.kwargs["block_size"], 256)
+        self.assertEqual(kernel.kwargs["num_queries_per_kv"], 4)
+        self.assertEqual(kernel.kwargs["num_warps"], 4)
+
+    def test_single_loop_arithmetic_body_is_frozen_reference_ast(self):
+        from nanovllm.speculative.jetspec.paged_backend import _packed_paged_tree_fp32
+        def source_loop(kernel):
+            node = ast.parse(inspect.getsource(kernel.fn)).body[0]
+            loops = [part for part in ast.walk(node) if isinstance(part, ast.For)]
+            self.assertEqual(len(loops), 1)
+            return loops[0]
+        def arithmetic(loop):
+            start = next(i for i, node in enumerate(loop.body) if isinstance(node, ast.Assign)
+                         and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "k")
+            return ast.dump(ast.Module(body=loop.body[start:], type_ignores=[]), include_attributes=False)
+        reference = source_loop(_packed_paged_tree_fp32)
+        candidate = source_loop(tree_prefix._packed_tree_prefix_single_loop_fp32)
+        self.assertEqual(ast.dump(candidate.iter, include_attributes=False),
+                         ast.dump(reference.iter, include_attributes=False))
+        self.assertEqual(arithmetic(candidate), arithmetic(reference))
+
+    def test_single_loop_geometry_explicit_fallback(self):
+        args = self.inputs(32)
+        expected = object()
+        with patch.object(tree_prefix, "packed_tree_attention_reference", return_value=expected) as reference:
+            result = tree_prefix.packed_tree_attention_prefix_single_loop(*args, output_dtype=torch.float32)
+        self.assertIs(result, expected)
+        reference.assert_called_once_with(*args, output_dtype=torch.float32)
 
 
 if __name__ == "__main__":
