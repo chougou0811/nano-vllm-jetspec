@@ -80,6 +80,10 @@ class JetSpecBatchRuntime:
         self._batched_draft_enabled = False
         self._feature_storage = False
         self._attention_backend = "sdpa"
+        # Full Target FA prefill exceeded the trained-model numerical envelope.
+        # Serving keeps the qualified SDPA prefill, including chunked recompute;
+        # the explicit Flash choice below changes only ragged Draft attention.
+        self._prefill_attention_backend = "sdpa"
         self._batch_proposer = None
         self.eos_token_ids = set()
         for value in (getattr(tokenizer, "eos_token_id", None),
@@ -104,6 +108,7 @@ class JetSpecBatchRuntime:
         self._batched_draft_enabled = bool(batched_draft)
         self._feature_storage = bool(feature_storage)
         self._attention_backend = attention_backend
+        self._prefill_attention_backend = "sdpa"
         self._batch_proposer = None
 
     def _configure_state(self, state):
@@ -209,8 +214,8 @@ class JetSpecBatchRuntime:
         try:
             reset_context()
             hidden = forward_chunk(self.target, context, count, self.target_layer_ids,
-                **({"attention_backend": self._attention_backend}
-                   if getattr(self, "_attention_backend", "sdpa") != "sdpa" else {}))
+                **({"attention_backend": self._prefill_attention_backend}
+                   if getattr(self, "_prefill_attention_backend", "sdpa") != "sdpa" else {}))
             if context.remaining_tokens:
                 return None
             context.begin_writes()
@@ -292,8 +297,8 @@ class JetSpecBatchRuntime:
         hidden, prompt_kv, taps = self.target.model.forward_dense(
             ids[0], torch.arange(prompt_length, device=ids.device), None, None,
             self.target_layer_ids,
-            **({"attention_backend": self._attention_backend}
-               if getattr(self, "_attention_backend", "sdpa") != "sdpa" else {}),
+            **({"attention_backend": self._prefill_attention_backend}
+               if getattr(self, "_prefill_attention_backend", "sdpa") != "sdpa" else {}),
         )
         # Only the final prompt row predicts the first output. The debug path
         # retains the qualified full-prefill GEMM shape for numerical controls.
@@ -433,8 +438,8 @@ class JetSpecBatchRuntime:
         reset_context()
         _, prompt_kv, taps = self.target.model.forward_dense(
             prefix, torch.arange(prefix.numel(), device=ids.device), None, None, self.target_layer_ids,
-            **({"attention_backend": self._attention_backend}
-               if getattr(self, "_attention_backend", "sdpa") != "sdpa" else {}),
+            **({"attention_backend": self._prefill_attention_backend}
+               if getattr(self, "_prefill_attention_backend", "sdpa") != "sdpa" else {}),
         )
         state = None
         try:

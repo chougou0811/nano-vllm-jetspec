@@ -59,6 +59,10 @@ class FlashPrefillMetadataTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "batched"):
                 runtime.configure_optimizations(attention_backend="flash_attn")
             self.assertEqual(runtime._attention_backend, "sdpa")
+            with patch("nanovllm.speculative.jetspec.flash_prefill.require_flash_attention"):
+                runtime.configure_optimizations(batched_draft=True, attention_backend="flash_attn")
+            self.assertEqual(runtime._attention_backend, "flash_attn")
+            self.assertEqual(runtime._prefill_attention_backend, "sdpa")
         finally:
             runtime.close()
 

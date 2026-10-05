@@ -61,8 +61,9 @@ class LLMEngine:
         processed between steps; one packed Target verify executes per decode.
         Chunked initial/recompute prefill runs between decode rounds. Its token
         budget is separate from the packed verification query budget.
-        External FlashAttention is opt-in for causal prefill and ragged Draft;
-        the qualified FP32 packed tree verification backend remains unchanged.
+        External FlashAttention is opt-in for ragged Draft. Target prefill stays
+        on SDPA after a negative FA numerical qualification; the qualified FP32
+        packed tree verification backend also remains unchanged.
         """
         serving = getattr(self, "_jetspec_scheduler", None)
         if serving is not None:
