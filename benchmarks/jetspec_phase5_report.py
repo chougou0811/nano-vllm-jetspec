@@ -76,7 +76,11 @@ def median(values):
 
 
 def compact_sample(sample):
-    return {key: deepcopy(value) for key, value in sample.items() if key not in BULK_SAMPLE_FIELDS}
+    result = {key: deepcopy(value) for key, value in sample.items() if key not in BULK_SAMPLE_FIELDS}
+    if "requests" in sample:
+        result["public_request_output_sha256"] = hashlib.sha256(json.dumps(
+            [row["token_ids"] for row in sample["requests"]], separators=(",", ":")).encode()).hexdigest()
+    return result
 
 
 def compact_worker(worker):
@@ -123,6 +127,8 @@ def matched_summary(reference, candidate):
         validate_worker(worker, role)
     for key in ("manifest_sha256", "manifest_file_sha256", "cases", "config", "serving_policy", "models"):
         require(reference[key] == candidate[key], f"practical serving mismatch: {key}")
+    for key in ("shape", "dtype", "bytes", "block_size"):
+        require(reference["pool"][key] == candidate["pool"][key], f"KV pool geometry mismatch: {key}")
     for key in ("torch", "cuda", "gpu", "compute_capability", "executable", "packages"):
         require(reference["environment"][key] == candidate["environment"][key], f"environment mismatch: {key}")
     result = []

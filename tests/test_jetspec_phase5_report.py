@@ -39,6 +39,8 @@ def fake_worker(label, gain=1):
         "config": {"tensor_parallel_size": 1, "enforce_eager": True, "max_model_len": 4096},
         "serving_policy": {"enable_chunked_prefill": False, "attention_backend": "sdpa", "tree_budget": 63},
         "models": {"target": {"path": "/target"}, "draft": {"path": "/draft"}},
+        "pool": {"shape": [2, 36, 249, 256, 8, 128], "dtype": "torch.bfloat16",
+                 "bytes": 9399435264, "block_size": 256},
         "environment": {key: "same" for key in
             ("torch", "cuda", "gpu", "compute_capability", "executable", "packages")},
         "actual_tree_path": {"profiler_removed_for_timed_samples": True,
@@ -146,6 +148,14 @@ class Phase5ReportCPU(unittest.TestCase):
             self.candidate[key] = "other"
             with self.assertRaises((ValueError, AttributeError)):
                 self.publish()
+
+    def test_pool_geometry_must_match_but_process_local_addresses_do_not(self):
+        self.reference["pool"].update(object_id=1, data_ptr=1000)
+        self.candidate["pool"].update(object_id=2, data_ptr=2000)
+        self.assertTrue(self.publish()["passed"])
+        self.candidate["pool"]["shape"][2] = 250
+        with self.assertRaisesRegex(ValueError, "KV pool geometry mismatch"):
+            self.publish()
 
     def test_fewer_repeats_duplicate_ids_missing_warmups_and_edited_workload_rejected(self):
         changes = [lambda w: w["samples"].pop(), lambda w: w["samples"][0].update(repeat=1),
