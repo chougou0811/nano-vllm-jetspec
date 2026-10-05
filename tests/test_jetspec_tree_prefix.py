@@ -142,6 +142,42 @@ class TreePrefixTests(unittest.TestCase):
         self.assertIs(result, expected)
         reference.assert_called_once_with(*args, output_dtype=torch.float32)
 
+    def test_split_exact_both_arithmetic_bodies_match_frozen_ast(self):
+        from nanovllm.speculative.jetspec.paged_backend import _packed_paged_tree_fp32
+        def loops(kernel):
+            node = ast.parse(inspect.getsource(kernel.fn)).body[0]
+            return [part for part in ast.walk(node) if isinstance(part, ast.For)]
+        def arithmetic(loop):
+            start = next(i for i, node in enumerate(loop.body) if isinstance(node, ast.Assign)
+                         and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "k")
+            return ast.dump(ast.Module(body=loop.body[start:], type_ignores=[]), include_attributes=False)
+        expected = arithmetic(loops(_packed_paged_tree_fp32)[0])
+        candidate_loops = loops(tree_prefix._packed_tree_prefix_split_exact_fp32)
+        self.assertEqual(len(candidate_loops), 2)
+        for loop in candidate_loops:
+            self.assertEqual(arithmetic(loop), expected)
+        self.assertEqual(ast.unparse(candidate_loops[0].iter), "range(0, prefix_tiles)")
+        self.assertEqual(ast.unparse(candidate_loops[1].iter), "range(prefix_tiles, num_tiles)")
+
+    def test_split_exact_launcher_uses_original_scalar_grid_tile_and_warps(self):
+        args = self.inputs()
+        output, kernel = FakeTensor((94, 32, 128)), Launch()
+        with patch.object(tree_prefix, "_validate", return_value=output), \
+                patch.object(tree_prefix, "_packed_tree_prefix_split_exact_fp32", kernel):
+            result = tree_prefix.packed_tree_attention_prefix_split_exact(*args, output_dtype=torch.float32)
+        self.assertIs(result, output)
+        self.assertEqual(kernel.grid, (94, 32))
+        self.assertEqual(kernel.kwargs["TILE"], 64)
+        self.assertEqual(kernel.kwargs["num_warps"], 4)
+
+    def test_split_exact_unsupported_page_geometry_explicit_reference(self):
+        args = self.inputs(16)
+        expected = object()
+        with patch.object(tree_prefix, "packed_tree_attention_reference", return_value=expected) as reference:
+            result = tree_prefix.packed_tree_attention_prefix_split_exact(*args)
+        self.assertIs(result, expected)
+        reference.assert_called_once_with(*args, output_dtype=None)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,8 @@ the upstream BF16 probability-matmul implementation is permitted.
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
@@ -210,6 +212,30 @@ def _packed_paged_tree_fp32(
     )
 
 
+@lru_cache(maxsize=None)
+def _tree_attention_device_capability(device_index: int) -> tuple[int, int]:
+    """Resolve hardware once, not through a device query in every layer."""
+    return torch.cuda.get_device_capability(device_index)
+
+
+def _use_prefix_tree_attention(q, k_pool, v_pool, metadata, groups) -> bool:
+    """Measured SM120/Qwen3 geometry only; unsupported devices stay frozen.
+
+    Host metadata selects the path without .item()/tolist() or GPU barriers.
+    c1 short-prefix launch overhead did not amortize in the preregistered
+    operator matrix. Multi-request tiles amortize from one complete TILE64.
+    This changes neither tree policy nor request scheduling.
+    """
+    if (q.dtype != torch.bfloat16 or k_pool.dtype != q.dtype or v_pool.dtype != q.dtype
+            or q.shape[1:] != (32, 128) or k_pool.shape[2:] != (8, 128)
+            or groups != 4 or metadata.block_size != 256):
+        return False
+    longest_prefix = max(metadata.prefix_lengths, default=0)
+    if longest_prefix < (256 if metadata.num_requests == 1 else 64):
+        return False
+    return _tree_attention_device_capability(q.device.index) == (12, 0)
+
+
 def packed_tree_attention(
     q: torch.Tensor,
     k_pool: torch.Tensor,
@@ -217,8 +243,19 @@ def packed_tree_attention(
     metadata: PackedTreeMetadata,
     scale: float,
     num_queries_per_kv: int,
+    *,
+    backend: str = "auto",
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """A single ragged launch over Q=sum(T_i), with no cross-request keys."""
+    """One ragged launch with independent request/ancestor visibility.
+
+    ``auto`` uses the qualified address-only prefix specialization on measured
+    SM120/BF16/Qwen3 geometry, otherwise the frozen scalar FP32 kernel.
+    Explicit reference/prefix entries support unchanged native operands and
+    FP32 output stores for numerical diagnostics, never BF16 probabilities.
+    """
+    if backend not in ("auto", "reference", "prefix"):
+        raise ValueError("tree attention backend must be auto, reference or prefix")
     if q.ndim != 3 or q.shape[0] != metadata.total_queries:
         raise ValueError("packed queries do not match the metadata")
     if k_pool.ndim != 4 or k_pool.shape != v_pool.shape or k_pool.shape[1] != metadata.block_size:
@@ -230,7 +267,17 @@ def packed_tree_attention(
         raise ValueError("unsupported packed query/KV head geometry")
     if num_queries_per_kv <= 0 or num_query_heads != k_pool.shape[2] * num_queries_per_kv:
         raise ValueError("invalid packed GQA head grouping")
-    out = torch.empty_like(q)
+    if output_dtype not in (None, q.dtype, torch.float32):
+        raise ValueError("output dtype must match input or be FP32 for qualification")
+    if backend == "reference":
+        from nanovllm.speculative.jetspec.tree_attention import packed_tree_attention_reference
+        return packed_tree_attention_reference(q, k_pool, v_pool, metadata, scale,
+            num_queries_per_kv, output_dtype=output_dtype)
+    if backend == "prefix" or _use_prefix_tree_attention(q, k_pool, v_pool, metadata, num_queries_per_kv):
+        from nanovllm.speculative.jetspec.tree_prefix import packed_tree_attention_prefix_split_exact
+        return packed_tree_attention_prefix_split_exact(q, k_pool, v_pool, metadata, scale,
+            num_queries_per_kv, output_dtype=output_dtype, num_warps=4)
+    out = torch.empty_like(q, dtype=output_dtype or q.dtype)
     _packed_paged_tree_fp32[(total_q, num_query_heads)](
         out, q, k_pool, v_pool,
         metadata.query_to_request, metadata.query_local_row,
