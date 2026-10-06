@@ -40,10 +40,7 @@ def run(args):
         original_verify = runtime._verify_batch
         def kernel_policy(policy):
             model = runtime.target.model
-            model._jetspec_tree_norm = policy == "fused"
             for layer in model.layers:
-                layer._jetspec_tree_norm = policy == "fused"
-                layer.self_attn._jetspec_tree_norm = policy == "fused"
                 layer.self_attn._jetspec_tree_fusion = policy != "reference"
         def replay(requests, trees, transaction, metadata):
             slots = torch.cat(transaction.node_slots)
@@ -61,12 +58,13 @@ def run(args):
             runtime._target_execution = args.target_execution
             kernel_policy(args.target_kernels)
             hidden_candidate = []
-            hook = runtime.target.lm_head.register_forward_pre_hook(
+            hook = None if args.target_execution == "cuda_graph" else runtime.target.lm_head.register_forward_pre_hook(
                 lambda module, inputs: hidden_candidate.append(inputs[0].detach().clone()))
             try:
                 logits, taps = original_verify(requests, trees, transaction, metadata)
             finally:
-                hook.remove()
+                if hook is not None:
+                    hook.remove()
             hidden = runtime._target_graph.last_hidden if args.target_execution == "cuda_graph" else hidden_candidate[-1]
             hidden = hidden.clone()
             kv = chunks.raw_kv(runtime, slots).clone()
@@ -142,6 +140,15 @@ def run(args):
             frozen.require(all(report["pressure"][name] for name in ("deferred_seen", "recovered")), "pressure gate failed")
             frozen.require(all(report["preemption"][name] for name in
                 ("preemption_seen", "resume_seen", "output_exactly_once", "fixed_schedule_replay_exact")), "preemption gate failed")
+            def chunk_mode(selected_engine, selected_args, concurrency, chunk):
+                engine.configure_jetspec(args.draft, optimization="serving", attention_backend="sdpa",
+                    target_execution=args.target_execution, target_kernels=args.target_kernels,
+                    enable_chunked_prefill=bool(chunk), prefill_chunk_size=chunk or 256,
+                    max_prefill_tokens=chunk or 4096)
+                engine._jetspec_scheduler.max_num_seqs = concurrency
+                return runtime
+            with frozen.patch(chunks, "configure", chunk_mode):
+                report["chunked_lifecycle_recompute"] = chunks.lifecycle_qualification(engine, args)
         report["graph"] = runtime._target_graph.snapshot() if runtime._target_graph else None
         engine.disable_jetspec()
         report["allocator_cleanup"] = not engine.scheduler.block_manager.used_block_ids
@@ -163,7 +170,8 @@ def main():
     for name in ("repo", "target", "draft", "output"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--target-execution", choices=("eager", "cuda_graph"), default="cuda_graph")
-    parser.add_argument("--target-kernels", choices=("reference", "fused_rope", "fused"), default="reference")
+    parser.add_argument("--target-kernels", choices=("reference", "fused_rope"), default="reference")
+    parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--oracle", default=serving.ORACLE)
     parser.add_argument("--deadline", type=float, default=600)
     args = parser.parse_args()
