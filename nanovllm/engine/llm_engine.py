@@ -64,7 +64,9 @@ class LLMEngine:
         budget is separate from the packed verification query budget.
         External FlashAttention is opt-in for ragged Draft. Target prefill stays
         on SDPA after a negative FA numerical qualification; the qualified FP32
-        packed tree verification backend also remains unchanged.
+        packed tree verification backend remains the legacy default. Explicit
+        target_kernels='fused_rope_gqa' selects grouped Tensor Core tree attention
+        plus the existing RoPE/scatter fusion; target CUDA Graph remains opt-in.
         """
         serving = getattr(self, "_jetspec_scheduler", None)
         if serving is not None:

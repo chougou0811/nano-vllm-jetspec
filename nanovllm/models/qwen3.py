@@ -236,7 +236,8 @@ class Qwen3Attention(nn.Module):
                 self.rotary_emb.cos_sin_cache, k_pool, v_pool, node_slots,
                 torch.empty_like(q))
             out = packed_tree_attention(q, k_pool, v_pool, packed_metadata,
-                self.scaling, self.num_heads // self.num_kv_heads)
+                self.scaling, self.num_heads // self.num_kv_heads,
+                backend="gqa" if getattr(self, "_jetspec_tree_gqa", False) else "auto")
             return self.o_proj(out.flatten(1, -1))
         cos, sin = self.rotary_emb.cos_sin_cache[positions].chunk(2, dim=-1)
         cos = cos.to(q.dtype)

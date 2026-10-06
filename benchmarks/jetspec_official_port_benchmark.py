@@ -24,7 +24,7 @@ import jetspec_flash_serving_benchmark as policy
 previous = upstream.previous
 require, save, sha = upstream.require, upstream.save, upstream.sha
 TARGET_EXECUTIONS = ("eager", "cuda_graph")
-TARGET_KERNELS = ("reference", "fused_rope")
+TARGET_KERNELS = ("reference", "fused_rope", "fused_rope_gqa")
 CASE_NAMES = tuple(f"c{c}_o{o}" for c in (1, 4, 8) for o in (128, 512))
 
 
@@ -93,8 +93,10 @@ class TargetPathEvidence(AbstractContextManager):
         rope_called = called("tree_fusion.py", "rope_scatter_prevalidated")
         norm_called = (called("tree_norm.py", "reference_rms_norm") or
                        called("tree_norm.py", "rms_norm"))
-        if self.kernels == "fused_rope":
+        if self.kernels in ("fused_rope", "fused_rope_gqa"):
             require(rope_called, "warmup missed original fused RoPE/scatter wrapper")
+        if self.kernels == "fused_rope_gqa":
+            require(called("tree_gqa.py", "packed_tree_attention_gqa"), "requested grouped tree kernel missed")
         require(not norm_called, "unqualified RMS prototype unexpectedly entered the serving path")
         if self.kernels == "reference":
             require(not rope_called, "reference Target unexpectedly used fused RoPE/scatter")

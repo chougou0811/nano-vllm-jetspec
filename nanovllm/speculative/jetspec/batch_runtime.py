@@ -106,8 +106,8 @@ class JetSpecBatchRuntime:
         if target_execution not in ("eager", "cuda_graph"):
             raise ValueError("Target execution must be 'eager' or 'cuda_graph'")
         target_kernels = getattr(self, "_target_kernels", "reference") if target_kernels is None else target_kernels
-        if target_kernels not in ("reference", "fused_rope"):
-            raise ValueError("Target kernels must be reference or fused_rope")
+        if target_kernels not in ("reference", "fused_rope", "fused_rope_gqa"):
+            raise ValueError("Target kernels must be reference, fused_rope or fused_rope_gqa")
         if attention_backend == "flash_attn":
             if not batched_draft:
                 raise ValueError("FlashAttention Draft requires the batched serving adapter")
@@ -129,6 +129,7 @@ class JetSpecBatchRuntime:
         if model is not None:
             for layer in getattr(model, "layers", ()):
                 layer.self_attn._jetspec_tree_fusion = target_kernels != "reference"
+                layer.self_attn._jetspec_tree_gqa = target_kernels == "fused_rope_gqa"
         # Warm graphs survive idle reconfiguration (including disable/reenable).
         # They own resident tensors, not allocator page leases; close() frees them.
 

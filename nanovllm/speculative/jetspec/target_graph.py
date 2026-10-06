@@ -21,10 +21,10 @@ _DEVICE_FIELDS = ("cu_seqlens_q", "query_to_request", "query_local_row",
                   "qq_bias_offsets", "node_counts")
 
 
-def graph_signature(metadata, *, prefix_backend: bool) -> tuple:
+def graph_signature(metadata, *, prefix_backend: bool, gqa_backend: bool = False) -> tuple:
     """Only execution geometry matters; no request ID/prefix/slot is cached."""
     return (metadata.total_queries, len(metadata.prefix_lengths),
-            metadata.qq_bias.numel(), bool(prefix_backend))
+            metadata.qq_bias.numel(), "gqa" if gqa_backend else bool(prefix_backend))
 
 
 class PackedTargetGraph:
@@ -112,10 +112,13 @@ class PackedTargetGraph:
         # values in the captured loops, NOT frozen capture-time scalar bounds.
         from nanovllm.speculative.jetspec.paged_backend import _use_prefix_tree_attention
         attn = self.target.model.layers[0].self_attn
-        query_probe = self.kv_pool.new_empty((0, attn.num_heads, attn.head_dim))
-        prefix = _use_prefix_tree_attention(query_probe, self.kv_pool[0, 0],
-            self.kv_pool[1, 0], metadata, attn.num_heads // attn.num_kv_heads)
-        key = graph_signature(metadata, prefix_backend=prefix)
+        gqa = getattr(attn, "_jetspec_tree_gqa", False)
+        prefix = False
+        if not gqa:
+            query_probe = self.kv_pool.new_empty((0, attn.num_heads, attn.head_dim))
+            prefix = _use_prefix_tree_attention(query_probe, self.kv_pool[0, 0],
+                self.kv_pool[1, 0], metadata, attn.num_heads // attn.num_kv_heads)
+        key = graph_signature(metadata, prefix_backend=prefix, gqa_backend=gqa)
         entry = self.entries.get(key)
         if entry is None and len(self.entries) >= self.max_graphs:
             # Finite memory: uncommon shapes execute the original eager path.

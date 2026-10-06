@@ -1,8 +1,9 @@
-"""JetSpec paged-tree attention with an explicit FP32 numerical contract.
+"""JetSpec paged-tree attention with explicit numerical backend policies.
 
 Both legacy c1 and genuinely packed ragged verification use FP32 multiply,
 reduction and online softmax with TILE=64. No batch-size-triggered switch to
-the upstream BF16 probability-matmul implementation is permitted.
+the upstream BF16 probability-matmul implementation is permitted in legacy auto.
+The opt-in gqa backend uses grouped Tensor Core/BF16-P arithmetic explicitly.
 """
 
 from __future__ import annotations
@@ -254,8 +255,8 @@ def packed_tree_attention(
     Explicit reference/prefix entries support unchanged native operands and
     FP32 output stores for numerical diagnostics, never BF16 probabilities.
     """
-    if backend not in ("auto", "reference", "prefix"):
-        raise ValueError("tree attention backend must be auto, reference or prefix")
+    if backend not in ("auto", "reference", "prefix", "gqa"):
+        raise ValueError("tree attention backend must be auto, reference, prefix or gqa")
     if q.ndim != 3 or q.shape[0] != metadata.total_queries:
         raise ValueError("packed queries do not match the metadata")
     if k_pool.ndim != 4 or k_pool.shape != v_pool.shape or k_pool.shape[1] != metadata.block_size:
@@ -269,6 +270,10 @@ def packed_tree_attention(
         raise ValueError("invalid packed GQA head grouping")
     if output_dtype not in (None, q.dtype, torch.float32):
         raise ValueError("output dtype must match input or be FP32 for qualification")
+    if backend == "gqa":
+        from nanovllm.speculative.jetspec.tree_gqa import packed_tree_attention_gqa
+        return packed_tree_attention_gqa(q, k_pool, v_pool, metadata, scale,
+            num_queries_per_kv, output_dtype=output_dtype)
     if backend == "reference":
         from nanovllm.speculative.jetspec.tree_attention import packed_tree_attention_reference
         return packed_tree_attention_reference(q, k_pool, v_pool, metadata, scale,

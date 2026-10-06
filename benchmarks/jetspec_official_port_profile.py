@@ -12,7 +12,7 @@ def main():
     for name in ("repo", "target", "draft", "manifest", "output", "expected-head", "expected-production-sha"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--target-execution", choices=("eager", "cuda_graph"), default="cuda_graph")
-    parser.add_argument("--target-kernels", choices=("reference", "fused_rope"), default="fused_rope")
+    parser.add_argument("--target-kernels", choices=("reference", "fused_rope", "fused_rope_gqa"), default="fused_rope")
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--output-scale", type=int, default=512)
     parser.add_argument("--threshold", type=int, default=128)
