@@ -85,6 +85,8 @@ class JetSpecBatchRuntime:
         # the explicit Flash choice below changes only ragged Draft attention.
         self._prefill_attention_backend = "sdpa"
         self._batch_proposer = None
+        self._target_execution = "eager"
+        self._target_graph = None
         self.eos_token_ids = set()
         for value in (getattr(tokenizer, "eos_token_id", None),
                       getattr(getattr(target, "generation_config", None), "eos_token_id", None)):
@@ -92,13 +94,16 @@ class JetSpecBatchRuntime:
                 self.eos_token_ids.update(value if isinstance(value, (list, tuple, set)) else [value])
 
     def configure_optimizations(self, *, lightweight=False, batched_draft=False,
-                                feature_storage=False, attention_backend="sdpa"):
+                                feature_storage=False, attention_backend="sdpa",
+                                target_execution="eager"):
         """Select independently measurable serving paths at an idle boundary."""
         self._check_idle()
         if self.requests or getattr(self, "prefills", {}):
             raise RuntimeError("optimization policy cannot change with live requests")
         if attention_backend not in ("sdpa", "flash_attn"):
             raise ValueError("JetSpec attention backend must be 'sdpa' or 'flash_attn'")
+        if target_execution not in ("eager", "cuda_graph"):
+            raise ValueError("Target execution must be 'eager' or 'cuda_graph'")
         if attention_backend == "flash_attn":
             if not batched_draft:
                 raise ValueError("FlashAttention Draft requires the batched serving adapter")
@@ -110,6 +115,9 @@ class JetSpecBatchRuntime:
         self._attention_backend = attention_backend
         self._prefill_attention_backend = "sdpa"
         self._batch_proposer = None
+        self._target_execution = target_execution
+        # Warm graphs survive idle reconfiguration (including disable/reenable).
+        # They own resident tensors, not allocator page leases; close() frees them.
 
     def _configure_state(self, state):
         state.validate_device = not getattr(self, "_lightweight", False)
@@ -471,6 +479,12 @@ class JetSpecBatchRuntime:
         transaction.arena.check_stream()
         tokens = torch.cat([t.token_ids for t in trees])
         positions = torch.cat([r.state.cache_len + t.depth.long() for r, t in zip(requests, trees)])
+        if getattr(self, "_target_execution", "eager") == "cuda_graph":
+            if self._target_graph is None:
+                from nanovllm.speculative.jetspec.target_graph import PackedTargetGraph
+                self._target_graph = PackedTargetGraph(self.target, self.kv_pool,
+                    self.target_layer_ids, self.max_model_len)
+            return self._target_graph.verify(tokens, positions, metadata)
         hidden, taps = self.target.model.forward_packed_tree(
             tokens, positions, self.kv_pool, metadata, self.target_layer_ids,
         )
@@ -823,5 +837,8 @@ class JetSpecBatchRuntime:
         for r in list(self.requests.values()):
             self.cancel(r)
         self.arena.clear()
+        if getattr(self, "_target_graph", None) is not None:
+            self._target_graph.close()
+            self._target_graph = None
         self._closed = True
         reset_context()

@@ -53,7 +53,8 @@ class LLMEngine:
                          default_tree_budget: int = 63, max_admissions_per_step: int = 2,
                          max_prefill_tokens: int | None = None,
                          enable_chunked_prefill: bool = True, prefill_chunk_size: int = 256,
-                         optimization: str = "serving", attention_backend: str = "sdpa"):
+                         optimization: str = "serving", attention_backend: str = "sdpa",
+                         target_execution: str = "eager"):
         """Select the greedy Continuous Batching adapter for add/step/cancel.
 
         Like nano-vLLM's ordinary engine this is a synchronous event loop, not
@@ -83,7 +84,8 @@ class LLMEngine:
         optimized = optimization == "serving"
         runtime.configure_optimizations(lightweight=optimized, batched_draft=optimized,
                                         feature_storage=optimized,
-                                        attention_backend=attention_backend)
+                                        attention_backend=attention_backend,
+                                        target_execution=target_execution)
         from nanovllm.engine.jetspec_scheduler import JetSpecScheduler
         config = self.model_runner.config
         self._jetspec_scheduler = JetSpecScheduler(runtime, config.max_num_seqs,
