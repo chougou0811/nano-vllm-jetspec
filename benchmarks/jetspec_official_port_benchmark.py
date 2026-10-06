@@ -135,8 +135,16 @@ def prepare_jetspec(engine, runtime, args, concurrency):
     engine.model_runner.config.max_num_seqs = engine.scheduler.max_num_seqs = concurrency
     require(not manager.hash_to_block_id and all(b.hash == -1 and not b.token_ids for b in manager.blocks),
             "new allocator is not cold")
-    keywords = dict(policy.SERVING_POLICY, attention_backend="sdpa")
     parameters = inspect.signature(engine.configure_jetspec).parameters
+    keywords = dict(policy.SERVING_POLICY)
+    if "attention_backend" in parameters:
+        keywords["attention_backend"] = "sdpa"
+    else:
+        # Frozen Phase 4 b388330 predates this optional policy API and only
+        # exposes its original SDPA implementation, with no backend fields.
+        require(getattr(runtime, "_attention_backend", "sdpa") == "sdpa" and
+                getattr(runtime, "_prefill_attention_backend", "sdpa") == "sdpa",
+                "snapshot without backend API does not use the original SDPA policy")
     # The old frozen JetSpec worker legitimately has no graph/kernel policy API.
     for name, value, default in (("target_execution", args.target_execution, "eager"),
                                  ("target_kernels", args.target_kernels, "reference")):
@@ -146,8 +154,9 @@ def prepare_jetspec(engine, runtime, args, concurrency):
             require(value == default, f"snapshot has no {name} API for requested optimization")
     serving = engine.configure_jetspec(args.draft, **keywords)
     require(serving.runtime is runtime and serving.max_num_seqs == concurrency, "serving runtime/config changed")
-    require(runtime._lightweight and runtime._attention_backend == "sdpa" and
-            runtime._prefill_attention_backend == "sdpa", "unqualified or diagnostic attention policy selected")
+    require(runtime._lightweight and getattr(runtime, "_attention_backend", "sdpa") == "sdpa" and
+            getattr(runtime, "_prefill_attention_backend", "sdpa") == "sdpa",
+            "unqualified or diagnostic attention policy selected")
     require(getattr(runtime, "_target_execution", "eager") == args.target_execution, "Target execution not applied")
     require(getattr(runtime, "_target_kernels", "reference") == args.target_kernels, "Target kernels not applied")
     return previous.idle_boundary(engine, runtime, allow_scratch=False)
