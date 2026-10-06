@@ -21,8 +21,9 @@ It is not an HTTP server. JetSpec prefix sharing, sampling, TP and CUDA Graph
 execution are not qualified. The ordinary nano-vLLM path retains its separate
 features; do not attribute its CUDA Graph/TP support to the JetSpec path.
 
-See the [current serving API](#chunked-prefill-and-recompute) and
-[Phase 4 measurements](#jetspec-phase-4-profile-driven-serving-optimization).
+See the [current serving API](#chunked-prefill-and-recompute),
+[final matched AR/JetSpec measurements](#final-matched-ordinary-ar-vs-jetspec),
+and [historical Phase 4 measurements](#jetspec-phase-4-profile-driven-serving-optimization).
 Older phase sections below are historical snapshots, not a cumulative list
 of current limitations or guarantees.
 
@@ -162,6 +163,77 @@ artifacts are **not included** in a GitHub clone. The portable smoke above is
 the supported fresh-clone entry point, not a claim that every historical trace
 can be regenerated without its inputs. Phase 4 speedups compare against this
 fork's Phase 3.2 commit, not a current optimized vLLM installation.
+
+## Final matched ordinary AR vs JetSpec
+
+[Final evidence](benchmarks/final_matched_benchmark.json) benchmarks the frozen
+`b388330` implementation: RTX 5090, Qwen3-8B BF16, TP=1, eager, greedy,
+`gpu_memory_utilization=0.8`, model/batched-token limits 4096. **Chunked Prefill
+is disabled** (`enable_chunked_prefill=False`); it is a separate serving
+capability, not a contribution to these speedups. No production implementation
+or parameter policy was changed, and no post-result tuning was performed.
+
+Important baseline scope: this environment has **no FlashAttention**. The
+ordinary baseline is this fork's preserved ordinary AR path with its existing
+**SDPA compatibility fallback**, greedy guard and resident-admission cap. These
+are **not** measurements of pristine upstream FlashAttention nano-vLLM, nor of
+an optimized vLLM installation. The baseline qualifier must accompany any
+resume/public performance claim.
+
+Each case/mode has one warmup and three timed samples, all included. Throughput
+is actual output tokens divided by synchronized workload wall time; speedup is
+the ratio of the two throughput medians. Both modes share the same Target
+object, resident Draft weights, and **249-page / 256-token-page KV pool** with
+unchanged storage address. Allocator prefix-cache metadata is cold at every
+sample start; native within-workload prefix reuse is retained. `max_num_seqs`
+equals case concurrency for both schedulers, and mode order is alternated.
+
+| Concurrency / output cap scale | Ordinary AR tok/s | Final JetSpec tok/s | Median speedup |
+|---|---:|---:|---:|
+| c1 / 128 | 25.08 | 145.13 | 5.79x |
+| c1 / 512 | 25.15 | 163.84 | 6.51x |
+| c4 / 128 | 45.54 | 278.34 | 6.11x |
+| c4 / 512 | 46.41 | 352.76 | 7.60x |
+| c8 / 128 | 53.98 | 302.69 | 5.61x |
+| c8 / 512 | 53.40 | 388.11 | 7.27x |
+
+These are the unchanged prior workloads, not newly optimized synthetic cases:
+two arrival waves, `2*c` requests, prompt lengths 128/1024/2048, tree budgets
+63/31/47, and output caps cycling `O/O/O/2/O/4`. Thus c8/512 means a **mixed cap
+scale with maximum 512**, not that every request emits 512. EOS is ignored to
+keep actual requested output counts fixed. All six complete token-workload
+hashes match the prior chunked-prefill benchmark. Arrival times are identical
+offered wall-clock times; synchronous step submission delays are recorded
+separately, rather than pretending actual submission times are identical.
+
+The c8/512 resume example was locked before measurements: 53.40 -> 388.11 tok/s,
+**7.27x**, with delivery TPOT 129.26 -> 14.63 ms. Offered-clock request p50 TTFT
+is 8.095 -> 1.130 s and E2E is 68.327 -> 10.231 s; submitted-clock p50 values
+are 8.044 -> 1.087 s and 68.326 -> 10.173 s. These latency summaries take the
+median of each run's request statistic, not a pooled-request percentile.
+JetSpec emits 39.00 effective tokens per packed Target verification round,
+or 7.47 per participating request (prefill anchors excluded).
+
+This is not an across-the-board streaming improvement: c8/512 per-request
+inter-delivery gap p95 is **140.94 -> 232.44 ms** (median of run p95), and the
+worst observed max across all three runs is 403.99 -> 412.57 ms. Delivery TPOT
+is `(last delivery - first delivery)/(output tokens - 1)`, not internal token
+ITL; speculative tokens arrive in bursts. Peak PyTorch allocated/reserved GPU
+memory is 26.32/26.53 -> 27.53/28.87 GiB (max across runs), and peak leased KV
+pages are 39 -> 53. All 48 warmup/timed workloads pass exactly-once/cap and
+cleanup checks, returning all 249 pages after idle scratch release.
+
+The JSON includes all 36 timed per-run statistics, provenance, workload hashes,
+peak memory/capacity, delivery metrics and full-raw artifact paths/SHA256. The
+larger raw token/event ledger and complete prompt manifest are retained outside
+Git on the measurement machine. To reproduce this exact frozen configuration:
+
+```bash
+git worktree add --detach /path/to/frozen-checkout b388330
+python benchmarks/jetspec_final_matched.py --repo /path/to/frozen-checkout \
+  --target "$TARGET" --draft "$DRAFT" --warmup 1 --repeats 3 \
+  --deadline 1800 --expected-pool-blocks 249 --output artifacts/final-matched-raw.json
+```
 
 ## Chunked prefill and recompute
 
