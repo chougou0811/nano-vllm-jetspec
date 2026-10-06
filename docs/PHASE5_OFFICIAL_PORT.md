@@ -148,6 +148,8 @@ Latency 表是各正式 sample 的 per-request 统计再取 median；gap max 是
 decode 又从 running 队头选取；它能很早交付新请求首 token，随后出现长 decode 等待。
 JetSpec 使用严格 active admission、round-robin 和多 token block delivery，因此首 token 排队及
 burst gap 行为不同。这是保留两边自然 serving policy 的实际系统对比，不是统一调度器实验。
+c1/c4/c8 指相同 `max_num_seqs` 用户配置；upstream 实测 peak running 为2/8/16，
+而 JetSpec 严格遵守 active cap，不能宣称两边严格同 resident request 数。
 不能声称“TTFT 更好”或“所有 latency 都更好”。
 
 优化版相对 Phase4 allocated 多约1.16GiB，reserved 多约1.76GiB；native KV pool 仍为

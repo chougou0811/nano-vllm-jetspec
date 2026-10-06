@@ -47,6 +47,11 @@ def main():
         "max_native_error": 0.001953125, "seed": 53, "shape": [32, 47, 128],
         "strides": [256, 8192, 2], "weight_stride": 2,
         "production_policy": "not exposed or integrated into serving"}]
+    report["interpretation"]["concurrency"] = (
+        "c1/c4/c8 denote identical max_num_seqs user configuration, not identical strict resident-request caps. "
+        "Pristine upstream limits each scheduled batch but admits waiting prefills independently of total running; "
+        "measured peak running requests are 2/8/16. JetSpec uses strict active admission. "
+        "Both natural policies remain unchanged; native_peak_running_requests is retained in every raw upstream sample.")
     report["official_comparison"] = {
         "sources": {"README": f"{OFFICIAL_ROOT}/README.md",
                     "reference_driver": f"{OFFICIAL_ROOT}/bench/reference/benchmark.py",
