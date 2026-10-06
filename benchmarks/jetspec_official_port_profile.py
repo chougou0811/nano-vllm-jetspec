@@ -37,6 +37,15 @@ def main():
     report["official_port_execution_policy"] = {
         "target_execution": args.target_execution, "target_kernels": args.target_kernels}
     report["official_port_profile_harness_sha256"] = benchmark.upstream.file_sha(__file__)
+    trace = benchmark.json.loads(benchmark.Path(report["kernel_window"]["trace_path"]).read_text())
+    graph_launches = profile.Counter(event.get("name", "") for event in trace.get("traceEvents", [])
+        if event.get("ph") == "X" and event.get("cat") in ("cuda_runtime", "cuda_driver")
+        and "GraphLaunch" in event.get("name", ""))
+    report["kernel_window"]["cuda_graph_launch_calls"] = dict(graph_launches)
+    report["kernel_window"]["cuda_graph_launch_count"] = sum(graph_launches.values())
+    report["kernel_window"]["launch_count_note"] = (
+        "Individual kernel host launches and graph host launches are separate. "
+        "CUDA Graph replay does not remove the underlying GPU kernels; their activity is recorded by CUPTI.")
     benchmark.save(args.output, report)
 
 
