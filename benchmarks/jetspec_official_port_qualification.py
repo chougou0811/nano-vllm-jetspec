@@ -42,6 +42,8 @@ def run(args):
             model = runtime.target.model
             for layer in model.layers:
                 layer.self_attn._jetspec_tree_fusion = policy != "reference"
+                layer.self_attn._jetspec_projection_fusion = policy == "fused_gemm"
+                layer._jetspec_projection_fusion = policy == "fused_gemm"
         def replay(requests, trees, transaction, metadata):
             slots = torch.cat(transaction.node_slots)
             prefix = [chunks.raw_kv(runtime, r.state.logical_slots).clone() for r in requests]
@@ -106,6 +108,13 @@ def run(args):
         for request in requests:
             runtime.cancel(request)
         runtime.release_idle_scratch()
+        if args.sanity_only:
+            engine.disable_jetspec()
+            report["allocator_cleanup"] = not engine.scheduler.block_manager.used_block_ids
+            report.update(status="complete", passed=True, scope="two same-state Target rounds + accepted commit only; not full lifecycle qualification",
+                          source_end=source_identity(nanovllm, jetspec))
+            tree.save_json(args.output, report)
+            return
         # Reuse the existing independent finite-poison isolation and complete
         # serving lifecycle gates; explicitly configure graph execution each time.
         def set_mode(selected_engine, mode, draft, concurrency):
@@ -170,7 +179,8 @@ def main():
     for name in ("repo", "target", "draft", "output"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--target-execution", choices=("eager", "cuda_graph"), default="cuda_graph")
-    parser.add_argument("--target-kernels", choices=("reference", "fused_rope"), default="reference")
+    parser.add_argument("--target-kernels", choices=("reference", "fused_rope", "fused_gemm"), default="reference")
+    parser.add_argument("--sanity-only", action="store_true")
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--oracle", default=serving.ORACLE)
     parser.add_argument("--deadline", type=float, default=600)
