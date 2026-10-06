@@ -98,6 +98,8 @@ class PackedTargetGraph:
         metadata.validate_pool_geometry(self.kv_pool)
         if tokens.ndim != 1 or tokens.shape != positions.shape or tokens.numel() != metadata.total_queries:
             raise ValueError("invalid packed graph token/position geometry")
+        if tokens.dtype not in (torch.int32, torch.int64) or positions.dtype not in (torch.int32, torch.int64):
+            raise ValueError("packed graph tokens and positions must be integer tensors")
         if tokens.device != self.kv_pool.device or positions.device != self.kv_pool.device:
             raise ValueError("packed graph inputs must share the live KV device")
         if self._pool_identity() != self.pool_identity:

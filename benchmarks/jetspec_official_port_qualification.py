@@ -119,7 +119,13 @@ def run(args):
             engine._jetspec_scheduler.max_num_seqs = concurrency
         prompts = {row["id"]: row for row in __import__("json").loads(Path(args.oracle).read_text())["prompts"]}
         with frozen.patch(serving, "set_mode", set_mode):
-            report["isolation"] = serving.eight_request_isolation(engine, prompts, args.draft)
+            # The historical isolation probe assumes owned output tensors. Graph
+            # outputs are borrowed and would be overwritten by its controls,
+            # giving a vacuous comparison. Clone only in this diagnostic adapter.
+            def owned_verify(*arguments):
+                return tuple(value.clone() for value in original_verify(*arguments))
+            with frozen.patch(runtime, "_verify_batch", owned_verify):
+                report["isolation"] = serving.eight_request_isolation(engine, prompts, args.draft)
             frozen.require(report["isolation"]["finite_same_shape_controls_passed"], "request/ancestor isolation failed")
             set_mode(engine, "jetspec", args.draft, 2)
             with serving.ServingProbe(engine, diagnostic=True) as probe:

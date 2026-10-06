@@ -640,6 +640,8 @@ class Qwen3Model(nn.Module):
         """
         if input_ids.ndim != 1 or positions.ndim != 1 or input_ids.shape != positions.shape:
             raise ValueError("packed Target input IDs and RoPE positions must be flat equal-length vectors")
+        if input_ids.dtype not in (torch.int32, torch.int64) or positions.dtype not in (torch.int32, torch.int64):
+            raise ValueError("packed Target tokens and positions must be integer tensors")
         if input_ids.numel() != metadata.total_queries:
             raise ValueError("packed Target input length does not match tree metadata")
         if input_ids.device != kv_pool.device or positions.device != kv_pool.device:
