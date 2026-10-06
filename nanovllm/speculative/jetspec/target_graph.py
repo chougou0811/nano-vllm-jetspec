@@ -42,6 +42,7 @@ class PackedTargetGraph:
         self.max_graphs = int(max_graphs)
         self.entries = {}
         self.pool = None
+        self.capture_stream = torch.cuda.Stream(device=kv_pool.device)
         self.ready = None
         self.captures = self.replays = self.eager_fallbacks = 0
         self.staged_bytes = 0
@@ -121,6 +122,7 @@ class PackedTargetGraph:
             hidden, taps = self.target.model.forward_packed_tree(
                 tokens, positions, self.kv_pool, metadata, self.target_layer_ids)
             result = self.target.lm_head(hidden), taps
+            self.last_hidden = hidden
             self._record_ready()
             return result
         if entry is None:
@@ -128,7 +130,8 @@ class PackedTargetGraph:
             # These writes target THIS transaction's scratch, never a zero/default
             # slot or a committed prefix. Warm-up compiles all lazy Triton kernels
             # before capture and exercises precisely the actual input shape.
-            stream = torch.cuda.Stream(device=self.kv_pool.device)
+            # Sharing a graph memory pool also requires one capture stream.
+            stream = self.capture_stream
             stream.wait_stream(torch.cuda.current_stream(self.kv_pool.device))
             try:
                 with torch.cuda.stream(stream):

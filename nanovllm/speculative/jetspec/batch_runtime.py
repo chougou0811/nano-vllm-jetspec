@@ -86,6 +86,7 @@ class JetSpecBatchRuntime:
         self._prefill_attention_backend = "sdpa"
         self._batch_proposer = None
         self._target_execution = "eager"
+        self._target_kernels = "reference"
         self._target_graph = None
         self.eos_token_ids = set()
         for value in (getattr(tokenizer, "eos_token_id", None),
@@ -95,7 +96,7 @@ class JetSpecBatchRuntime:
 
     def configure_optimizations(self, *, lightweight=False, batched_draft=False,
                                 feature_storage=False, attention_backend="sdpa",
-                                target_execution="eager"):
+                                target_execution="eager", target_kernels=None):
         """Select independently measurable serving paths at an idle boundary."""
         self._check_idle()
         if self.requests or getattr(self, "prefills", {}):
@@ -104,6 +105,9 @@ class JetSpecBatchRuntime:
             raise ValueError("JetSpec attention backend must be 'sdpa' or 'flash_attn'")
         if target_execution not in ("eager", "cuda_graph"):
             raise ValueError("Target execution must be 'eager' or 'cuda_graph'")
+        target_kernels = getattr(self, "_target_kernels", "reference") if target_kernels is None else target_kernels
+        if target_kernels not in ("reference", "fused_rope", "fused"):
+            raise ValueError("Target kernels must be reference, fused_rope or fused")
         if attention_backend == "flash_attn":
             if not batched_draft:
                 raise ValueError("FlashAttention Draft requires the batched serving adapter")
@@ -116,6 +120,18 @@ class JetSpecBatchRuntime:
         self._prefill_attention_backend = "sdpa"
         self._batch_proposer = None
         self._target_execution = target_execution
+        if target_kernels != getattr(self, "_target_kernels", "reference"):
+            if self._target_graph is not None:
+                self._target_graph.close()
+                self._target_graph = None
+        self._target_kernels = target_kernels
+        model = getattr(self.target, "model", None)
+        if model is not None:
+            model._jetspec_tree_norm = target_kernels == "fused"
+            for layer in getattr(model, "layers", ()):
+                layer._jetspec_tree_norm = target_kernels == "fused"
+                layer.self_attn._jetspec_tree_norm = target_kernels == "fused"
+                layer.self_attn._jetspec_tree_fusion = target_kernels != "reference"
         # Warm graphs survive idle reconfiguration (including disable/reenable).
         # They own resident tensors, not allocator page leases; close() frees them.
 

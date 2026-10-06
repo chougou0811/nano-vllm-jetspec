@@ -23,7 +23,7 @@ def run(args):
     report = {"status": "in_progress", "passed": False, "invocation": vars(args),
               "source": source_identity(nanovllm, jetspec), "same_state": [],
               "contract": {"whole_network_bf16_bound": tree.BF16_BOUND,
-                "attention_pre_store_fp32_bound": tree.FP32_BOUND,
+                "attention_pre_store_fp32_bound": 1e-4,
                 "cross_shape_token_bitwise_required": False,
                 "request_isolation_byte_exact_required": True}}
     tree.save_json(args.output, report)
@@ -34,15 +34,23 @@ def run(args):
             gpu_memory_utilization=.8, max_num_seqs=8, max_model_len=4096,
             max_num_batched_tokens=4096, kvcache_block_size=256)
         engine.configure_jetspec(args.draft, optimization="serving", attention_backend="sdpa",
-            target_execution=args.target_execution, enable_chunked_prefill=False,
+            target_execution=args.target_execution, target_kernels=args.target_kernels, enable_chunked_prefill=False,
             max_prefill_tokens=4096, max_admissions_per_step=8)
         runtime = engine._jetspec_scheduler.runtime
         original_verify = runtime._verify_batch
+        def kernel_policy(policy):
+            model = runtime.target.model
+            model._jetspec_tree_norm = policy == "fused"
+            for layer in model.layers:
+                layer._jetspec_tree_norm = policy == "fused"
+                layer.self_attn._jetspec_tree_norm = policy == "fused"
+                layer.self_attn._jetspec_tree_fusion = policy != "reference"
         def replay(requests, trees, transaction, metadata):
             slots = torch.cat(transaction.node_slots)
             prefix = [chunks.raw_kv(runtime, r.state.logical_slots).clone() for r in requests]
             hidden_ref = []
             runtime._target_execution = "eager"
+            kernel_policy("reference")
             hook = runtime.target.lm_head.register_forward_pre_hook(
                 lambda module, inputs: hidden_ref.append(inputs[0].detach().clone()))
             try:
@@ -51,6 +59,7 @@ def run(args):
                 hook.remove()
             ref_kv = chunks.raw_kv(runtime, slots).clone()
             runtime._target_execution = args.target_execution
+            kernel_policy(args.target_kernels)
             hidden_candidate = []
             hook = runtime.target.lm_head.register_forward_pre_hook(
                 lambda module, inputs: hidden_candidate.append(inputs[0].detach().clone()))
@@ -105,7 +114,7 @@ def run(args):
             frozen.require(mode == "jetspec" and selected_engine is engine, "invalid qualification mode")
             engine.scheduler.max_num_seqs = concurrency
             engine.configure_jetspec(draft, optimization="serving", attention_backend="sdpa",
-                target_execution=args.target_execution, enable_chunked_prefill=False,
+                target_execution=args.target_execution, target_kernels=args.target_kernels, enable_chunked_prefill=False,
                 max_prefill_tokens=4096, max_admissions_per_step=2)
             engine._jetspec_scheduler.max_num_seqs = concurrency
         prompts = {row["id"]: row for row in __import__("json").loads(Path(args.oracle).read_text())["prompts"]}
@@ -148,6 +157,7 @@ def main():
     for name in ("repo", "target", "draft", "output"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--target-execution", choices=("eager", "cuda_graph"), default="cuda_graph")
+    parser.add_argument("--target-kernels", choices=("reference", "fused_rope", "fused"), default="reference")
     parser.add_argument("--oracle", default=serving.ORACLE)
     parser.add_argument("--deadline", type=float, default=600)
     args = parser.parse_args()

@@ -21,6 +21,13 @@ def _reference_rms_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
     return norm.weight * hidden.to(input_dtype)
 
 
+def _packed_rms_norm(x, norm, enabled=False):
+    if enabled:
+        from nanovllm.speculative.jetspec.tree_norm import reference_rms_norm
+        return reference_rms_norm(x, norm)
+    return _reference_rms_norm(x, norm)
+
+
 class Qwen3Attention(nn.Module):
 
     def __init__(
@@ -221,8 +228,22 @@ class Qwen3Attention(nn.Module):
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         if not self.qkv_bias:
-            q = _reference_rms_norm(q, self.q_norm)
-            k = _reference_rms_norm(k, self.k_norm)
+            fused_norm = packed_metadata is not None and getattr(self, "_jetspec_tree_norm", False)
+            q = _packed_rms_norm(q, self.q_norm, fused_norm)
+            k = _packed_rms_norm(k, self.k_norm, fused_norm)
+        if packed_metadata is not None and getattr(self, "_jetspec_tree_fusion", False):
+            # Transaction admission validates node slots; Target validates model,
+            # pool, positions and QKV geometry before this private serving launch.
+            # Q/K RMS remains separate. Every RoPE BF16 multiplication boundary
+            # is retained before the fused direct scratch scatter.
+            from nanovllm.speculative.jetspec.tree_fusion import rope_scatter_prevalidated
+            from nanovllm.speculative.jetspec.paged_backend import packed_tree_attention
+            q = rope_scatter_prevalidated(q, k, v, positions,
+                self.rotary_emb.cos_sin_cache, k_pool, v_pool, node_slots,
+                torch.empty_like(q))
+            out = packed_tree_attention(q, k_pool, v_pool, packed_metadata,
+                self.scaling, self.num_heads // self.num_kv_heads)
+            return self.o_proj(out.flatten(1, -1))
         cos, sin = self.rotary_emb.cos_sin_cache[positions].chunk(2, dim=-1)
         cos = cos.to(q.dtype)
         sin = sin.to(q.dtype)
@@ -444,14 +465,16 @@ class Qwen3DecoderLayer(nn.Module):
         metadata,
     ) -> torch.Tensor:
         residual = hidden_states
-        normed = _reference_rms_norm(hidden_states, self.input_layernorm)
+        normed = _packed_rms_norm(hidden_states, self.input_layernorm,
+                                 getattr(self, "_jetspec_tree_norm", False))
         hidden_states = self.self_attn.forward_packed_tree(
             positions, normed, k_pool, v_pool, metadata,
         )
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.mlp.forward_dense(
-            _reference_rms_norm(hidden_states, self.post_attention_layernorm)
+            _packed_rms_norm(hidden_states, self.post_attention_layernorm,
+                             getattr(self, "_jetspec_tree_norm", False))
         )
         return residual + hidden_states
 
@@ -633,7 +656,8 @@ class Qwen3Model(nn.Module):
             )
             if layer_id in tap_set:
                 tapped.append(hidden_states)
-        hidden_states = _reference_rms_norm(hidden_states, self.norm)
+        hidden_states = _packed_rms_norm(hidden_states, self.norm,
+                                         getattr(self, "_jetspec_tree_norm", False))
         target_hidden = torch.cat(tapped, dim=-1) if tapped else None
         return hidden_states, target_hidden
 
