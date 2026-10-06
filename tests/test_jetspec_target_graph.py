@@ -284,7 +284,7 @@ class TargetGraphPolicyCPU(unittest.TestCase):
 
     def test_invalid_or_live_policy_change_cannot_release_graph(self):
         for kwargs in ({"target_execution": "unknown"}, {"target_kernels": "unknown"},
-                       {"target_kernels": "fused"}):
+                       {"target_kernels": "fused"}, {"target_kernels": "fused_gemm"}):
             runtime = self.runtime()
             graph = runtime._target_graph
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):

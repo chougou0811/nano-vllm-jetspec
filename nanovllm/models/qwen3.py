@@ -204,26 +204,19 @@ class Qwen3Attention(nn.Module):
         packed_metadata=None,
     ) -> torch.Tensor:
         """Reference-numeric QKV plus JetSpec-style paged tree attention."""
-        if packed_metadata is not None and getattr(self, "_jetspec_projection_fusion", False):
-            # Explicit performance candidate only: changing the GEMM shape may
-            # change BF16 accumulation. Dense/prefill/legacy retain the frozen
-            # independent projections and no serving default selects this path.
-            q, k, v = self.qkv_proj(hidden_states).split(
-                [self.q_size, self.kv_size, self.kv_size], dim=-1)
-        else:
-            weight = self.qkv_proj.weight
-            bias = self.qkv_proj.bias
-            q = F.linear(hidden_states, weight[:self.q_size], None if bias is None else bias[:self.q_size])
-            k = F.linear(
-                hidden_states,
-                weight[self.q_size:self.q_size + self.kv_size],
-                None if bias is None else bias[self.q_size:self.q_size + self.kv_size],
-            )
-            v = F.linear(
-                hidden_states,
-                weight[self.q_size + self.kv_size:],
-                None if bias is None else bias[self.q_size + self.kv_size:],
-            )
+        weight = self.qkv_proj.weight
+        bias = self.qkv_proj.bias
+        q = F.linear(hidden_states, weight[:self.q_size], None if bias is None else bias[:self.q_size])
+        k = F.linear(
+            hidden_states,
+            weight[self.q_size:self.q_size + self.kv_size],
+            None if bias is None else bias[self.q_size:self.q_size + self.kv_size],
+        )
+        v = F.linear(
+            hidden_states,
+            weight[self.q_size + self.kv_size:],
+            None if bias is None else bias[self.q_size + self.kv_size:],
+        )
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
@@ -360,16 +353,6 @@ class Qwen3MLP(nn.Module):
         up = F.linear(x, weight[width:], None if bias is None else bias[width:])
         return self.down_proj(F.silu(gate) * up)
 
-    def forward_packed_gemm(self, x):
-        """Explicit packed-only combined gate/up GEMM experiment.
-
-        Retain the native-dtype SiLU result and following multiply as separate
-        eager operations. Only the gate/up projection layout changes; regular
-        serving, dense prefill and recompute do not call this method.
-        """
-        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-        return self.down_proj(F.silu(gate) * up)
-
 
 class Qwen3DecoderLayer(nn.Module):
 
@@ -482,11 +465,9 @@ class Qwen3DecoderLayer(nn.Module):
         )
         hidden_states = residual + hidden_states
         residual = hidden_states
-        normed = _reference_rms_norm(hidden_states, self.post_attention_layernorm)
-        if getattr(self, "_jetspec_projection_fusion", False):
-            hidden_states = self.mlp.forward_packed_gemm(normed)
-        else:
-            hidden_states = self.mlp.forward_dense(normed)
+        hidden_states = self.mlp.forward_dense(
+            _reference_rms_norm(hidden_states, self.post_attention_layernorm)
+        )
         return residual + hidden_states
 
 
